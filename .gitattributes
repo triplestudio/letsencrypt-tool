@@ -1,0 +1,21 @@
+# 默认：文本文件在仓库内统一存为 LF
+* text=auto eol=lf
+
+# Windows 批处理必须保持 CRLF，否则 cmd.exe 解析 ( ) 代码块会报语法错误
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell 脚本在 Unix 上必须保持 LF，否则会报 bad interpreter
+*.sh text eol=lf
+
+# 证书类文件按文本处理，避免被当成二进制
+*.pem text eol=lf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

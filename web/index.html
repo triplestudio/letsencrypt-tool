@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Let's Encrypt 证书申请工具</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= 侧边栏 ================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="10.5" width="16" height="10" rx="2.5"/>
+          <path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>
+          <circle cx="12" cy="15.5" r="1.4"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <strong>Let's Encrypt</strong>
+        <span>证书申请向导</span>
+      </div>
+    </div>
+
+    <ol class="steps" id="steps">
+      <li class="step is-active" data-step="1">
+        <span class="step-dot">1</span>
+        <span class="step-label">
+          <b>填写域名信息</b>
+          <i>域名、邮箱、验证方式</i>
+        </span>
+      </li>
+      <li class="step" data-step="2">
+        <span class="step-dot">2</span>
+        <span class="step-label">
+          <b>验证域名所有权</b>
+          <i>按提示完成 CA 校验</i>
+        </span>
+      </li>
+      <li class="step" data-step="3">
+        <span class="step-dot">3</span>
+        <span class="step-label">
+          <b>签发并下载证书</b>
+          <i>部署到你的服务器</i>
+        </span>
+      </li>
+    </ol>
+
+    <div class="sidebar-foot">
+      <div class="badge-row">
+        <span class="badge" id="envBadge">正式环境</span>
+      </div>
+      <p class="hint">
+        证书私钥只保存在本机，不会上传到任何第三方。
+      </p>
+    </div>
+  </aside>
+
+  <!-- ================= 主区域 ================= -->
+  <main class="main">
+    <div class="main-scroll">
+      <div class="content">
+
+        <!-- ---------- 步骤 1 ---------- -->
+        <section class="panel" id="step1">
+          <header class="panel-head">
+            <h1>申请一张免费的 HTTPS 证书</h1>
+            <p>Let's Encrypt 签发的证书受所有主流浏览器信任，有效期 90 天，可无限次免费续期。</p>
+          </header>
+
+          <div class="field">
+            <label for="domains">
+              域名
+              <span class="req">必填</span>
+            </label>
+            <textarea id="domains" rows="3" spellcheck="false"
+              placeholder="example.com&#10;www.example.com&#10;*.example.com"></textarea>
+            <div class="field-help">
+              <span>多个域名用逗号或换行分隔；<code>*.example.com</code> 表示泛域名（需选 DNS 验证）。</span>
+            </div>
+            <div class="chips" id="domainChips"></div>
+          </div>
+
+          <div class="field">
+            <label for="email">
+              邮箱
+              <span class="opt">建议填写</span>
+            </label>
+            <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+            <div class="field-help">
+              用于接收证书到期提醒与安全通知。留空也能签发，但出问题时收不到通知。
+            </div>
+          </div>
+
+          <div class="field">
+            <label>验证方式 <span class="req">必选</span></label>
+            <p class="field-help" style="margin-top:-2px;margin-bottom:12px">
+              证书颁发机构（CA）需要确认域名确实由你控制，这一步就是完成这个证明。
+            </p>
+
+            <div class="option-grid" id="challengeOptions">
+              <label class="option" data-value="http_auto">
+                <input type="radio" name="challenge" value="http_auto" checked>
+                <span class="option-head">
+                  <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>
+                  <b>自动 HTTP 验证</b>
+                  <em class="tag tag-rec">推荐</em>
+                </span>
+                <span class="option-desc">
+                  本工具在 80 端口临时启动一个验证服务，全自动完成。适合证书就装在当前这台机器上。
+                </span>
+              </label>
+
+              <label class="option" data-value="http_manual">
+                <input type="radio" name="challenge" value="http_manual">
+                <span class="option-head">
+                  <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V5h16v2"/><path d="M12 5v14"/><path d="M9 19h6"/></svg>
+                  <b>手动 HTTP 验证</b>
+                </span>
+                <span class="option-desc">
+                  网站已在运行（Nginx / IIS / 宝塔等）。工具生成验证文件，你放进网站根目录即可，不用停服务。
+                </span>
+              </label>
+
+              <label class="option" data-value="dns">
+                <input type="radio" name="challenge" value="dns">
+                <span class="option-head">
+                  <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18"/></svg>
+                  <b>DNS 验证</b>
+                  <em class="tag">支持泛域名</em>
+                </span>
+                <span class="option-desc">
+                  在域名解析里加一条 TXT 记录。80 端口不通、走 CDN、或要申请泛域名证书时用这个。
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 条件字段 -->
+          <div class="field conditional" id="fieldWebroot">
+            <label for="webroot">网站根目录 <span class="opt">可选</span></label>
+            <input type="text" id="webroot" placeholder="例如 C:\www\site 或 /var/www/html">
+            <div class="field-help">
+              填写后工具会把验证文件直接写入该目录，省去手动复制。留空则显示文件内容由你自己放置。
+            </div>
+          </div>
+
+          <div class="field conditional" id="fieldPort">
+            <label for="httpPort">对外 HTTP 端口</label>
+            <input type="number" id="httpPort" value="80" min="1" max="65535">
+            <div class="field-help">
+              默认为 80。默认端口已被网站占用或用了端口映射时，可改成 8080 等（前提是外网 <code>http://域名/.well-known/</code> 能访问到该端口）。
+            </div>
+          </div>
+
+          <details class="advanced">
+            <summary>高级选项</summary>
+            <div class="field">
+              <label for="keyType">证书密钥类型</label>
+              <select id="keyType">
+                <option value="ec256" selected>ECDSA P-256（推荐，握手快、体积小）</option>
+                <option value="ec384">ECDSA P-384（更高强度）</option>
+                <option value="rsa2048">RSA 2048（兼容老旧设备）</option>
+                <option value="rsa4096">RSA 4096（最高兼容性）</option>
+              </select>
+              <div class="field-help">
+                极老的系统（Windows XP、Java 6、部分嵌入式设备）不支持 ECDSA，需要兼容它们时请选 RSA 2048。
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="switch-row" for="staging">
+                <input type="checkbox" id="staging">
+                <span class="switch"></span>
+                <span>
+                  使用测试环境（Staging）
+                  <em>签发的证书不被浏览器信任，但完全不影响正式配额，适合先演练流程。</em>
+                </span>
+              </label>
+            </div>
+          </details>
+
+          <div class="actions">
+            <button class="btn btn-primary" id="btnSubmit">
+              开始申请
+              <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </button>
+            <span class="actions-note">正式环境同一域名每周有签发次数限制，建议先用测试环境跑一遍。</span>
+          </div>
+        </section>
+
+        <!-- ---------- 步骤 2 ---------- -->
+        <section class="panel hidden" id="step2">
+          <header class="panel-head">
+            <h1>验证域名所有权</h1>
+            <p id="step2Subtitle">按下面的提示完成操作，然后点击「开始验证」。</p>
+          </header>
+
+          <div class="alert alert-warn hidden" id="warnBox"></div>
+
+          <!-- 域名状态 -->
+          <div class="block">
+            <h3 class="block-title">域名列表</h3>
+            <ul class="domain-list" id="challengeList"></ul>
+          </div>
+
+          <!-- 操作指引：自动 HTTP -->
+          <div class="block guide hidden" id="guideAuto">
+            <h3 class="block-title">需要做的操作</h3>
+            <div class="alert alert-ok" id="autoAlert">
+              <b>验证服务已启动。</b>本机已监听 HTTP 端口，CA 访问下列地址时能拿到验证内容，你可以直接点击下面的「开始验证」。
+            </div>
+            <ul class="url-list" id="autoUrls"></ul>
+            <div id="autoFallback" class="hidden"></div>
+            <p class="muted small">
+              如果点击验证后失败，通常是：域名没有解析到本机、80 端口未对外开放、或中间有 CDN / 反向代理拦截。
+              这种情况下建议改用「手动 HTTP」或「DNS」验证。
+            </p>
+            <button class="btn btn-ghost btn-sm" id="btnStopHttp">关闭临时验证服务</button>
+          </div>
+
+          <!-- 操作指引：手动 HTTP -->
+          <div class="block guide hidden" id="guideManual">
+            <h3 class="block-title">需要做的操作</h3>
+            <p class="guide-text">
+              在网站根目录下创建 <code>.well-known/acme-challenge/</code> 目录，并为下面每个域名写入一个验证文件，
+              <b>文件名就是末尾的字符串</b>，<b>文件内容必须与下方完全一致</b>（结尾不能多换行）。
+            </p>
+            <div id="manualFiles"></div>
+          </div>
+
+          <!-- 操作指引：DNS -->
+          <div class="block guide hidden" id="guideDns">
+            <h3 class="block-title">需要做的操作</h3>
+            <p class="guide-text">
+              到域名解析控制台添加下列 <b>TXT 记录</b>（记录类型选 TXT，主机记录填 <code>_acme-challenge</code> 对应的部分，
+              记录值填下面给出的内容）。解析生效通常需要 1&ndash;10 分钟。
+            </p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr><th>用途</th><th>主机记录 / 名称</th><th>记录值 (Value)</th><th></th></tr>
+                </thead>
+                <tbody id="dnsRows"></tbody>
+              </table>
+            </div>
+            <div class="dns-check">
+              <button class="btn btn-ghost btn-sm" id="btnCheckDns">检测解析是否生效</button>
+              <span class="muted small" id="dnsCheckResult"></span>
+            </div>
+          </div>
+
+          <div class="actions actions-between">
+            <button class="btn btn-ghost" id="btnBack1">返回修改</button>
+            <div class="actions-right">
+              <button class="btn btn-primary hidden" id="btnRetryPrepare">重新准备</button>
+              <button class="btn btn-primary" id="btnValidate">
+                开始验证
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------- 步骤 3 ---------- -->
+        <section class="panel hidden" id="step3">
+          <header class="panel-head">
+            <div class="success-mark">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </div>
+            <h1>证书已签发</h1>
+            <p>下载后按下面的配置片段部署即可，证书有效期 90 天，请注意在到期前续期。</p>
+          </header>
+
+          <!-- 摘要 -->
+          <div class="cert-card">
+            <div class="cert-main">
+              <div class="cert-domains" id="certDomains"></div>
+              <div class="cert-meta" id="certMeta"></div>
+            </div>
+            <div class="cert-validity">
+              <span class="validity-num" id="certDays">--</span>
+              <span class="validity-label">天后到期</span>
+            </div>
+          </div>
+
+          <div class="block">
+            <h3 class="block-title">下载</h3>
+            <div class="download-grid">
+              <a class="dl" href="#" data-kind="fullchain">
+                <b>fullchain.pem</b>
+                <span>证书 + 中间证书，Nginx / Apache / Node 用这个</span>
+              </a>
+              <a class="dl" href="#" data-kind="key">
+                <b>privkey.pem</b>
+                <span>证书私钥，务必保密</span>
+              </a>
+              <a class="dl" href="#" data-kind="cert">
+                <b>cert.pem</b>
+                <span>仅域名证书</span>
+              </a>
+              <a class="dl" href="#" data-kind="chain">
+                <b>chain.pem</b>
+                <span>仅中间证书</span>
+              </a>
+              <a class="dl dl-accent" href="#" data-kind="bundle">
+                <b>全部打包 .zip</b>
+                <span>包含以上所有文件</span>
+              </a>
+            </div>
+            <p class="muted small" style="margin-top:12px">
+              文件同时已保存到本机：<code id="outputDir"></code>
+            </p>
+          </div>
+
+          <div class="block">
+            <h3 class="block-title">部署配置</h3>
+            <div class="tabs" id="deployTabs">
+              <button class="tab is-active" data-tab="nginx">Nginx</button>
+              <button class="tab" data-tab="apache">Apache</button>
+              <button class="tab" data-tab="iis">IIS</button>
+              <button class="tab" data-tab="node">Node.js</button>
+            </div>
+            <div class="code-box">
+              <pre id="deployCode"></pre>
+              <button class="copy-btn" data-copy-target="deployCode">复制</button>
+            </div>
+          </div>
+
+          <div class="alert alert-info">
+            <b>关于续期：</b>Let's Encrypt 证书有效期 90 天，建议每 60 天执行一次续期。
+            重新运行本工具并申请相同域名即可获得新证书，然后用新文件覆盖旧文件并重载服务。
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-ghost" id="btnRestart">再申请一张证书</button>
+          </div>
+        </section>
+
+      </div>
+    </div>
+
+    <!-- ---------- 日志坞 ---------- -->
+    <div class="logdock" id="logdock">
+      <button class="logdock-head" id="logToggle">
+        <span class="dot-live"></span>
+        <b>运行日志</b>
+        <span class="logdock-last" id="logLast">等待开始…</span>
+        <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
+      </button>
+      <div class="logdock-body" id="logBody">
+        <div class="log-lines" id="logLines"><p class="muted small">暂无日志</p></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 加载遮罩 -->
+<div class="overlay hidden" id="overlay">
+  <div class="overlay-card">
+    <div class="spinner"></div>
+    <p id="overlayText">正在处理…</p>
+    <span id="overlayHint">请勿关闭此页面</span>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
