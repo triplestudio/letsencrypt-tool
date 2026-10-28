@@ -137,8 +137,12 @@ letsencrypt-tool/
 ├── app.py                本地 Web 服务与业务流程
 ├── acme_client.py        ACME v2 协议实现（JWS 签名、订单、挑战、签发）
 ├── requirements.txt      仅 cryptography 与 certifi
-├── web/                  界面（index.html / style.css / app.js）
-├── docs/                 文档（证书概念与文件说明）
+├── web/                  界面（index / deploy 两套页面）
+├── deploy/               阿里云 ALB 证书自动部署（可选，需额外装 SDK）
+│   ├── alb_deploy.py     上传证书并替换监听证书
+│   ├── ram-policy.json   最小权限策略
+│   └── run-alb-deploy.bat
+├── docs/                 文档（证书概念、ALB 部署）
 ├── data/accounts/        ACME 账号密钥（已被 .gitignore 排除）
 └── certs/                签发的证书（已被 .gitignore 排除）
 ```
@@ -163,6 +167,10 @@ letsencrypt-tool/
 - 为什么证书是好几个文件，`fullchain` / `cert` / `chain` / `privkey` 各自的作用
 - 各服务器到底该配哪两个文件，以及用 openssl 自查证书的 5 条命令
 - 术语速查表（ACME、order、authorization、challenge、leaf、intermediate…）
+
+需要把证书自动部署到阿里云负载均衡，见 [**把证书自动部署到阿里云 ALB**](./docs/deploy-alibaba-alb.md)：最小权限策略、幂等替换、线上校验、计划任务写法。
+
+装好 SDK 后，签发完成页会多出一个「部署到阿里云 ALB」入口；证书申请页左侧边栏底部也有常驻入口，未签发证书时也能直接进入。也可以在浏览器直接访问 `http://127.0.0.1:8899/deploy`：选证书、填 AccessKey 与监听 ID（可自动读取）、先预演后执行。「预演模式」开关常驻在页面主区域，不折叠在「高级选项」里。命令行与界面完全等价。
 
 ---
 

@@ -39,6 +39,10 @@ html, body {
   margin: 0;
   padding: 0;
   height: 100%;
+  /* 这是「整页固定高度 + 内部滚动」的布局：整个页面不滚动，
+     只有右侧内容区（.main-scroll）滚动。根元素一旦出现滚动条，
+     就会和内容区那条并排变成两条，滚动时还会带着侧边栏一起动。 */
+  overflow: hidden;
 }
 
 body {
@@ -63,6 +67,25 @@ code {
 .muted { color: var(--muted); }
 .small { font-size: 12.5px; }
 
+/* ============================ 滚动条 ============================ */
+/* 系统默认滚动条在 Windows 上是一条带箭头的灰条，与页面风格不搭。
+   统一改成细滑块：轨道透明，滑块悬停才明显。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #ccd6e0 transparent;
+}
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #ccd6e0;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #adbcc9; background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
 /* ============================ 布局 ============================ */
 
 .app {
@@ -84,7 +107,12 @@ code {
   min-height: 0;
   padding: 26px 20px 20px;
   overflow-y: auto;
+  /* 窗口矮时侧边栏可以滚，但不显示滚动条：
+     否则它会和右侧内容区的滚动条并排出现，看起来像两条滚动条 */
+  scrollbar-width: none;
 }
+
+.sidebar::-webkit-scrollbar { width: 0; height: 0; }
 
 .brand {
   display: flex;
@@ -243,7 +271,16 @@ code {
 .main-scroll {
   flex: 1 1 auto;
   min-height: 0;
+  /* 内容列 780 + 左右内边距 32 + 两侧预留的滚动条间隙 11，合计 866；
+     这样滚动条贴着内容走，宽屏下不会孤零零挂在窗口最右侧 */
+  width: 100%;
+  max-width: 866px;
+  margin: 0 auto;
   overflow-y: auto;
+  overflow-x: hidden;
+  /* 有滚动条时预留两侧空间：滚动条出现/消失都不会让内容左右位移 */
+  scrollbar-gutter: stable both-edges;
+  overscroll-behavior: contain;
   padding: 44px 32px 60px;
 }
 
@@ -466,6 +503,7 @@ select {
 
 /* 开关 */
 .switch-row {
+  position: relative;
   display: flex !important;
   align-items: flex-start;
   gap: 11px;
@@ -474,7 +512,18 @@ select {
   font-size: 13px;
 }
 
-.switch-row input { position: absolute; opacity: 0; }
+/* 输入框铺满整行：点哪都能切换，又不会脱离文档流乱飘。
+   之前用不带定位的 absolute，聚焦时浏览器会为了把它滚进视野而顶走内容区，
+   在已滚动的页面上表现为整页空白。 */
+.switch-row input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
 
 .switch {
   width: 36px;
@@ -512,6 +561,30 @@ select {
   margin-top: 3px;
   line-height: 1.6;
 }
+
+/* 预演模式：常显卡片，不放进高级折叠，避免被漏看 */
+.mode-card {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  padding: 15px 16px;
+  margin-bottom: 18px;
+  transition: border-color .15s, background .15s;
+}
+
+.mode-card.is-live {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+}
+
+.mode-card .mode-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.mode-card em { max-width: 64ch; }
 
 /* 高级选项折叠 */
 .advanced {
@@ -1098,7 +1171,14 @@ select {
   transition: max-height .28s ease;
 }
 
-.logdock.is-open .logdock-body { max-height: 240px; overflow-y: auto; }
+.logdock.is-open .logdock-body {
+  max-height: 240px;
+  overflow-y: auto;
+  /* 日志区自成一个面板：底色与内容区分开，这条滚动条不会被误认成页面滚动条 */
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  scrollbar-gutter: stable;
+}
 
 .log-lines {
   padding: 4px 26px 16px;

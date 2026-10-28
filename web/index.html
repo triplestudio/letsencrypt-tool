@@ -58,6 +58,10 @@
       <p class="hint">
         证书私钥只保存在本机，不会上传到任何第三方。
       </p>
+      <a href="/deploy" class="btn btn-ghost btn-sm" style="width:100%;margin-top:12px">
+        部署到阿里云 ALB
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
     </div>
   </aside>
 
@@ -337,8 +341,12 @@
             重新运行本工具并申请相同域名即可获得新证书，然后用新文件覆盖旧文件并重载服务。
           </div>
 
-          <div class="actions">
+          <div class="actions actions-between">
             <button class="btn btn-ghost" id="btnRestart">再申请一张证书</button>
+            <a class="btn btn-primary" href="/deploy">
+              部署到阿里云 ALB
+              <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </a>
           </div>
         </section>
 

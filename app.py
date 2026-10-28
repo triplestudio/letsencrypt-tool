@@ -541,6 +541,355 @@ def action_check_dns(sess: Session) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 阿里云 ALB 部署（界面后端）
+# --------------------------------------------------------------------------- #
+
+DEPLOY_DIR = BASE_DIR / "deploy"
+ALB_ENV_FILE = DATA_DIR / "alb.env"
+
+_ALBD = None
+DEPLOY_SERIAL = threading.Lock()
+DEPLOY_JOBS: dict[str, "DeployJob"] = {}
+DEPLOY_JOBS_LOCK = threading.Lock()
+
+EXIT_HINTS = {
+    0: "成功",
+    1: "本地证书问题",
+    2: "凭证或权限问题",
+    3: "证书上传失败",
+    4: "监听证书替换失败",
+    5: "线上校验未通过",
+    6: "运行环境问题",
+    7: "网络或域名解析问题",
+}
+
+
+def alb_module():
+    """延迟载入 deploy/alb_deploy.py，避免主界面因缺少可选依赖而起不来。"""
+    global _ALBD
+    if _ALBD is None:
+        if str(DEPLOY_DIR) not in sys.path:
+            sys.path.insert(0, str(DEPLOY_DIR))
+        import alb_deploy as mod
+        _ALBD = mod
+    return _ALBD
+
+
+class DeployJob:
+    """一次部署运行。日志由 alb_deploy 的 log sink 推入，前端轮询。"""
+
+    def __init__(self, params: dict):
+        self.id = secrets.token_urlsafe(9)
+        self.params = params
+        self.logs: list[dict] = []
+        self.running = True
+        self.exit_code: int | None = None
+        self.started_at = time.time()
+        self.finished_at: float | None = None
+
+    def append(self, entry: dict) -> None:
+        self.logs.append({
+            "time": entry.get("time") or datetime.datetime.now().strftime("%H:%M:%S"),
+            "level": entry.get("level", "info"),
+            "message": entry.get("message", ""),
+        })
+        if len(self.logs) > 800:
+            del self.logs[:200]
+
+    def note(self, message: str, level: str = "info") -> None:
+        self.append({"level": level, "message": message})
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "running": self.running,
+            "exit_code": self.exit_code,
+            "exit_hint": EXIT_HINTS.get(self.exit_code or 0, ""),
+            "elapsed": round((self.finished_at or time.time()) - self.started_at, 1),
+            "params": self.params,
+            "logs": self.logs[-250:],
+        }
+
+
+def list_cert_bundles() -> list:
+    """列出 certs/ 下可部署的证书，附带校验结论。"""
+    mod = alb_module()
+    items: list[dict] = []
+    if not CERT_DIR.is_dir():
+        return items
+
+    dirs = [d for d in CERT_DIR.iterdir() if d.is_dir() and (d / "fullchain.pem").is_file()]
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for d in dirs:
+        stat = d.stat()
+        item = {
+            "name": d.name,
+            "path": str(d),
+            "saved_at": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "usable": True,
+            "error": "",
+            "cn": "",
+            "san": [],
+            "serial": "",
+            "not_after": "",
+            "days_left": 0,
+            "cert_count": 0,
+            "key_type": "",
+        }
+        try:
+            info = mod.load_bundle(d, quiet=True)
+            item.update({
+                "cn": info["cn"],
+                "san": info["san"],
+                "serial": info["serial"],
+                "not_after": info["not_after"].strftime("%Y-%m-%d"),
+                "days_left": info["days_left"],
+                "cert_count": info["cert_count"],
+                "key_type": info["key_type"],
+            })
+        except Exception as exc:
+            item["usable"] = False
+            item["error"] = getattr(exc, "message", str(exc))
+        items.append(item)
+    return items
+
+
+def read_saved_credential() -> dict:
+    """只回传掩码后的 AK，绝不把 Secret 送到前端。"""
+    if not ALB_ENV_FILE.is_file():
+        return {"saved": False, "masked": "", "updated_at": ""}
+
+    pairs = {}
+    try:
+        for line in ALB_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            pairs[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        return {"saved": False, "masked": "", "updated_at": ""}
+
+    ak = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "") or pairs.get("ACCESS_KEY_ID", "")
+    sk = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "") or pairs.get("ACCESS_KEY_SECRET", "")
+    if not ak or not sk:
+        return {"saved": False, "masked": "", "updated_at": ""}
+
+    try:
+        stamp = datetime.datetime.fromtimestamp(ALB_ENV_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        stamp = ""
+    masked = (ak[:4] + "***" + ak[-4:]) if len(ak) > 8 else "***"
+    return {"saved": True, "masked": masked, "updated_at": stamp}
+
+
+def load_saved_secret() -> tuple:
+    """取回完整凭证，仅在服务端内部用于发起请求。"""
+    if not ALB_ENV_FILE.is_file():
+        return "", ""
+    pairs = {}
+    try:
+        for line in ALB_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            pairs[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        return "", ""
+    ak = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "") or pairs.get("ACCESS_KEY_ID", "")
+    sk = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "") or pairs.get("ACCESS_KEY_SECRET", "")
+    return ak, sk
+
+
+def save_credential(ak: str, sk: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    text = (
+        "# 阿里云 RAM 凭证 —— 本文件位于 data/ 下，已被 .gitignore 排除，请勿提交到仓库。\n"
+        "# 建议使用仅授予 ALB/CAS 相关动作的子账号，不要使用主账号 AccessKey。\n"
+        "ALIBABA_CLOUD_ACCESS_KEY_ID=%s\n"
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET=%s\n" % (ak, sk)
+    )
+    ALB_ENV_FILE.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(ALB_ENV_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def resolve_deploy_credential(body: dict) -> tuple:
+    """按优先级取凭证：表单填写的 > 已保存的。"""
+    ak = (body.get("access_key_id") or "").strip()
+    sk = (body.get("access_key_secret") or "").strip()
+    if ak and sk:
+        return ak, sk
+    if body.get("use_saved", True):
+        saved_ak, saved_sk = load_saved_secret()
+        if saved_ak and saved_sk:
+            return saved_ak, saved_sk
+    raise acme.AcmeError("缺少 AccessKey：请填写 AccessKey ID 与 Secret，或勾选使用已保存的凭证")
+
+
+def _deploy_argv(params: dict) -> list:
+    argv: list = []
+    for lsr in params["listeners"]:
+        argv += ["--listener-id", lsr]
+    argv += ["--region", params["region"]]
+    argv += ["--role", params["role"]]
+    argv += ["--cert-dir", params["cert_dir"]]
+    if params.get("verify_host"):
+        argv += ["--verify-host", params["verify_host"]]
+    if params.get("dry_run"):
+        argv.append("--dry-run")
+    if params.get("force_upload"):
+        argv.append("--force-upload")
+    if params.get("prune_old_cert"):
+        argv.append("--prune-old-cert")
+    if params.get("prune_additional"):
+        argv.append("--prune-additional")
+    if params.get("verbose"):
+        argv.append("--verbose")
+    return argv
+
+
+def _listener_id_hint(value: str) -> str:
+    """识别常见的“填错层级”的情况，给出可操作的提示。"""
+    low = value.lower()
+    prefix = low.split("-", 1)[0] if "-" in low else low
+    table = {
+        "alb": "ALB 实例 ID",
+        "lsg": "服务器组 ID",
+        "sgp": "服务器组 ID",
+        "rule": "转发规则 ID",
+        "acl": "访问控制策略组 ID",
+    }
+    if prefix in table:
+        label = table[prefix]
+        joiner = " " if label[0].isascii() else ""
+        return "%s 是%s%s，不是监听 ID；请在实例 → 监听 中复制 lsn- 开头的监听 ID" % (
+            value,
+            joiner,
+            label,
+        )
+    if low.startswith("http") or "/" in value:
+        return "请填写监听 ID，不要填 URL 或域名：%s" % value
+    return ""
+
+
+def parse_deploy_params(body: dict) -> dict:
+    mod = alb_module()
+
+    raw_listeners = body.get("listeners") or ""
+    if isinstance(raw_listeners, list):
+        raw_listeners = ",".join(str(x) for x in raw_listeners)
+    listeners: list[str] = []
+    for part in re.split(r"[,;\s]+", str(raw_listeners)):
+        part = part.strip()
+        if part and part not in listeners:
+            listeners.append(part)
+    if not listeners:
+        raise acme.AcmeError("请填写至少一个监听 ID（形如 lsn-xxxxxxxx）")
+    for lsr in listeners:
+        if re.match(r"^lsn-[A-Za-z0-9]+$", lsr):
+            continue
+        # 兼容早期误写的 lsr- 前缀，真正的 ALB 监听 ID 是 lsn-
+        if re.match(r"^lsr-[A-Za-z0-9]+$", lsr):
+            continue
+        hint = _listener_id_hint(lsr)
+        if hint:
+            raise acme.AcmeError(hint)
+        raise acme.AcmeError("监听 ID 格式不正确：%s（应以 lsn- 开头）" % lsr)
+
+    cert_dir = (body.get("cert_dir") or "").strip()
+    if not cert_dir:
+        raise acme.AcmeError("请选择要部署的证书")
+    candidate = Path(cert_dir).resolve()
+    if CERT_DIR.resolve() not in candidate.parents:
+        raise acme.AcmeError("证书目录必须位于 certs/ 下")
+    if not (candidate / "fullchain.pem").is_file():
+        raise acme.AcmeError("所选目录缺少 fullchain.pem")
+
+    role = body.get("role") or "default"
+    if role not in ("default", "additional"):
+        raise acme.AcmeError("证书用途取值不正确")
+
+    region = (body.get("region") or "cn-hangzhou").strip()
+    if not re.match(r"^[a-z0-9-]+$", region):
+        raise acme.AcmeError("地域格式不正确")
+
+    verify_host = (body.get("verify_host") or "").strip().lower()
+    if verify_host and not re.match(r"^[a-z0-9.*-]+$", verify_host):
+        raise acme.AcmeError("校验域名格式不正确")
+
+    return {
+        "listeners": listeners,
+        "region": region,
+        "role": role,
+        "cert_dir": str(candidate),
+        "cert_name": candidate.name,
+        "verify_host": verify_host,
+        "dry_run": bool(body.get("dry_run")),
+        "force_upload": bool(body.get("force_upload")),
+        "prune_old_cert": bool(body.get("prune_old_cert")),
+        "prune_additional": bool(body.get("prune_additional")),
+        "verbose": bool(body.get("verbose", True)),
+    }
+
+
+def run_deploy_job(job: DeployJob, params: dict, ak: str, sk: str) -> None:
+    mod = alb_module()
+    try:
+        mod.set_log_sink(job.append)
+        mod.set_credentials(ak, sk)
+        mod.set_verbose(params.get("verbose", False))
+        job.note("开始部署：监听 %s ｜ 地域 %s ｜ 证书 %s" % (
+            ", ".join(params["listeners"]), params["region"], params["cert_name"]), "step")
+        if params["dry_run"]:
+            job.note("当前为预演模式，只查询现状，不会上传或替换任何证书", "warn")
+        job.exit_code = mod.main(_deploy_argv(params))
+    except mod.DeployError as exc:
+        job.note(exc.message, "fail")
+        if exc.detail:
+            job.note(exc.detail, "debug")
+        job.exit_code = exc.exit_code
+    except Exception as exc:
+        traceback.print_exc()
+        job.note("部署过程出现未预期错误：%s: %s" % (type(exc).__name__, exc), "fail")
+        job.exit_code = 6
+    finally:
+        mod.set_log_sink(None)
+        mod.set_credentials("", "")
+        job.running = False
+        job.finished_at = time.time()
+        if job.exit_code == 0:
+            job.note("部署结束（耗时 %.1f 秒）" % (job.finished_at - job.started_at), "ok")
+        else:
+            job.note("部署结束，退出码 %s：%s" % (
+                job.exit_code, EXIT_HINTS.get(job.exit_code, "未知")), "fail")
+
+
+def probe_aliyun(ak: str, sk: str, region: str) -> dict:
+    """验证凭证并列出该地域的监听，一次调用解决「AK 对不对、有哪些监听」。"""
+    mod = alb_module()
+    if not DEPLOY_SERIAL.acquire(blocking=False):
+        raise acme.AcmeError("有部署任务正在运行，请稍后再试")
+    try:
+        clients = mod.AliyunClients(ak, sk, region)
+        listeners = clients.list_listeners()
+        cas_total = None
+        cas_error = ""
+        try:
+            cas_total = clients.probe_cas()
+        except Exception as exc:
+            cas_error = getattr(exc, "message", str(exc))
+        return {"listeners": listeners, "cas_total": cas_total, "cas_error": cas_error}
+    except mod.DeployError as exc:
+        raise acme.AcmeError(exc.message)
+    finally:
+        DEPLOY_SERIAL.release()
+
+
+# --------------------------------------------------------------------------- #
 # HTTP 处理
 # --------------------------------------------------------------------------- #
 
@@ -620,6 +969,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._serve_file(WEB_DIR / "index.html")
             return
+        if path in ("/deploy", "/deploy.html"):
+            self._serve_file(WEB_DIR / "deploy.html")
+            return
         if path.startswith("/static/"):
             rel = path[len("/static/"):]
             candidate = (WEB_DIR / rel).resolve()
@@ -630,6 +982,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._ok({"version": VERSION, "python": sys.version.split()[0]})
+            return
+        if path == "/api/deploy/certs":
+            self._ok({"certs": list_cert_bundles()})
+            return
+        if path == "/api/deploy/credential":
+            self._ok(read_saved_credential())
+            return
+        m = re.match(r"^/api/deploy/runs/([A-Za-z0-9_-]+)$", path)
+        if m:
+            job = DEPLOY_JOBS.get(m.group(1))
+            if not job:
+                self._fail("任务不存在或已失效", 404)
+                return
+            self._ok(job.to_dict())
             return
         m = re.match(r"^/api/sessions/([A-Za-z0-9_-]+)$", path)
         if m:
@@ -655,6 +1021,61 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_post(self, path: str):
         body = self._body()
+
+        if path == "/api/deploy/credential":
+            ak = (body.get("access_key_id") or "").strip()
+            sk = (body.get("access_key_secret") or "").strip()
+            if not ak or not sk:
+                raise acme.AcmeError("AccessKey ID 与 Secret 都不能为空")
+            if len(ak) < 12 or len(sk) < 16:
+                raise acme.AcmeError("AccessKey 长度异常，请确认已完整粘贴（ID 通常 24 位，Secret 通常 30 位）")
+            save_credential(ak, sk)
+            self._ok(read_saved_credential())
+            return
+
+        if path == "/api/deploy/credential/clear":
+            if ALB_ENV_FILE.is_file():
+                ALB_ENV_FILE.unlink()
+            self._ok(read_saved_credential())
+            return
+
+        if path == "/api/deploy/probe":
+            ak, sk = resolve_deploy_credential(body)
+            region = (body.get("region") or "cn-hangzhou").strip()
+            if not re.match(r"^[a-z0-9-]+$", region):
+                raise acme.AcmeError("地域格式不正确")
+            self._ok(probe_aliyun(ak, sk, region))
+            return
+
+        if path == "/api/deploy/run":
+            if not DEPLOY_SERIAL.acquire(blocking=False):
+                raise acme.AcmeError("已有部署任务正在运行，请等待其结束")
+            try:
+                params = parse_deploy_params(body)
+                ak, sk = resolve_deploy_credential(body)
+            except Exception:
+                DEPLOY_SERIAL.release()
+                raise
+
+            job = DeployJob(params)
+            with DEPLOY_JOBS_LOCK:
+                DEPLOY_JOBS[job.id] = job
+                if len(DEPLOY_JOBS) > 20:
+                    for stale in list(DEPLOY_JOBS)[:-20]:
+                        DEPLOY_JOBS.pop(stale, None)
+
+            def worker():
+                try:
+                    run_deploy_job(job, params, ak, sk)
+                finally:
+                    try:
+                        DEPLOY_SERIAL.release()
+                    except RuntimeError:
+                        pass
+
+            threading.Thread(target=worker, daemon=True).start()
+            self._ok(job.to_dict())
+            return
 
         if path == "/api/sessions":
             cfg = self._build_config(body)
@@ -807,6 +1228,43 @@ class Handler(BaseHTTPRequestHandler):
 # 启动
 # --------------------------------------------------------------------------- #
 
+class _Server(ThreadingHTTPServer):
+    """默认的 ThreadingHTTPServer 开着 SO_REUSEADDR，在 Windows 上会允许同一端口
+    被两个进程同时绑定：新实例看起来启动成功，请求却可能落到旧实例上跑旧代码，
+    排查时极难发现。这里在 Windows 关闭该选项，重复启动就会直接报端口被占用。"""
+
+    allow_reuse_address = os.name != "nt"
+
+
+def _port_listener_pid(port: int) -> str:
+    """尽力找出占用该端口的进程 PID（仅 Windows，查不到返回空串）。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=8,
+        ).stdout
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        cols = line.split()
+        if (
+            len(cols) >= 5
+            and cols[0].upper() == "TCP"
+            and cols[1].endswith(":%d" % port)
+            and cols[3].upper() == "LISTENING"
+        ):
+            return cols[4]
+    return ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Let's Encrypt 证书申请工具")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机）")
@@ -816,10 +1274,16 @@ def main():
 
     url = f"http://{args.host}:{args.port}/"
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = _Server((args.host, args.port), Handler)
     except OSError as exc:
-        print(f"\n启动失败：端口 {args.port} 无法监听（{exc}）")
-        print(f"可以换一个端口，例如：python app.py --port 8898\n")
+        pid = _port_listener_pid(args.port)
+        print(f"\n启动失败：端口 {args.port} 已被占用（{exc}）")
+        if pid:
+            print(f"占用进程 PID：{pid}，这是上一次启动后没有关掉的旧实例（跑的可能是旧代码）。")
+            print(f"先结束它：taskkill /PID {pid} /F")
+        else:
+            print("请关闭占用该端口的旧实例，或换一个端口。")
+        print(f"换端口启动示例：python app.py --port 8898\n")
         sys.exit(1)
 
     print("=" * 62)

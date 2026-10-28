@@ -1,0 +1,30 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "alb:ListListeners",
+        "alb:GetListenerAttribute",
+        "alb:ListListenerCertificates",
+        "alb:UpdateListenerAttribute",
+        "alb:AssociateAdditionalCertificatesWithListener",
+        "alb:DissociateAdditionalCertificatesFromListener"
+      ],
+      "Resource": [
+        "acs:alb:*:*:loadbalancer/*",
+        "acs:alb:*:*:listener/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cas:UploadUserCertificate",
+        "cas:DeleteUserCertificate",
+        "cas:GetUserCertificateDetail",
+        "cas:ListUserCertificateOrder"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

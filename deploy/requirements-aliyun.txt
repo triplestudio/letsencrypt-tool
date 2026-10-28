@@ -1,0 +1,11 @@
+# 阿里云 OpenAPI SDK（仅 deploy/alb_deploy.py 需要，主工具不依赖）
+#
+# 安装：
+#   Windows : .venv\Scripts\python.exe -m pip install -r deploy/requirements-aliyun.txt
+#   macOS/Linux: .venv/bin/python -m pip install -r deploy/requirements-aliyun.txt
+#
+# 如果不希望引入这两个包，也可以改用阿里云 CLI 自行编排，
+# 但 alb_deploy.py 的幂等判断与错误翻译就用不上了。
+
+alibabacloud_cas20200407
+alibabacloud_alb20200616
