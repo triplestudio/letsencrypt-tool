@@ -162,6 +162,51 @@
             </div>
           </div>
 
+          <!-- 自动写入解析（仅 DNS 验证可用） -->
+          <div class="field conditional" id="fieldDnsAuto">
+            <div class="mode-card" id="dnsAutoCard">
+              <label class="switch-row" for="dnsAuto">
+                <input type="checkbox" id="dnsAuto">
+                <span class="switch"></span>
+                <span>
+                  自动写入解析记录
+                  <em id="dnsAutoDesc">
+                    开启后由工具调用云解析接口写入 _acme-challenge 记录，验证结束自动删除，不需要手动复制。
+                  </em>
+                </span>
+              </label>
+
+              <div class="dns-cred hidden" id="dnsCredBox">
+                <div class="kv-grid">
+                  <div class="field-inline">
+                    <label for="dnsAk">AccessKey ID</label>
+                    <input type="text" id="dnsAk" spellcheck="false" placeholder="LTAI5t..." autocomplete="off">
+                  </div>
+                  <div class="field-inline">
+                    <label for="dnsSk">AccessKey Secret</label>
+                    <input type="password" id="dnsSk" spellcheck="false" placeholder="粘贴 Secret" autocomplete="new-password">
+                  </div>
+                </div>
+                <label class="switch-row switch-sm" for="dnsUseSaved">
+                  <input type="checkbox" id="dnsUseSaved">
+                  <span class="switch"></span>
+                  <span>
+                    使用已保存的云解析凭证
+                    <em id="dnsSavedHint">尚未保存过</em>
+                  </span>
+                </label>
+                <div class="dns-cred-actions">
+                  <button type="button" class="btn btn-ghost btn-sm" id="btnDnsProbe">验证凭证并读取域名</button>
+                  <span class="muted small" id="dnsProbeResult"></span>
+                </div>
+              </div>
+            </div>
+            <div class="field-help">
+              域名的 NS 必须指向阿里云云解析。建议单独建一个子账号，只授予 <code>alidns</code> 的
+              Add / Delete / Describe 三类权限；凭证保存在本机 <code>data/dns.env</code>，与部署凭证分开存放。
+            </div>
+          </div>
+
           <details class="advanced">
             <summary>高级选项</summary>
             <div class="field">
@@ -241,7 +286,8 @@
           <!-- 操作指引：DNS -->
           <div class="block guide hidden" id="guideDns">
             <h3 class="block-title">需要做的操作</h3>
-            <p class="guide-text">
+            <div class="alert alert-info hidden" id="dnsAutoStatus"></div>
+            <p class="guide-text" id="dnsGuideText">
               到域名解析控制台添加下列 <b>TXT 记录</b>（记录类型选 TXT，主机记录填 <code>_acme-challenge</code> 对应的部分，
               记录值填下面给出的内容）。解析生效通常需要 1&ndash;10 分钟。
             </p>
@@ -255,6 +301,8 @@
             </div>
             <div class="dns-check">
               <button class="btn btn-ghost btn-sm" id="btnCheckDns">检测解析是否生效</button>
+              <button class="btn btn-ghost btn-sm hidden" id="btnDnsRewrite">重新写入记录</button>
+              <button class="btn btn-ghost btn-sm hidden" id="btnDnsClean">立即清理记录</button>
               <span class="muted small" id="dnsCheckResult"></span>
             </div>
           </div>

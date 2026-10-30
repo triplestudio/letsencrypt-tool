@@ -28,6 +28,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import acme_client as acme  # noqa: E402
+from dns_providers import DnsError, provider_label  # noqa: E402
+from dns_providers import check as dns_check  # noqa: E402
+from dns_providers import create as create_dns_provider  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -66,6 +69,8 @@ class Session:
         self.output_dir: str | None = None
         self.preflight: dict = {}
         self.error: dict | None = None
+        self.dns_client = None            # provider 实例（延迟创建）
+        self.dns_records: list[dict] = []  # 由本工具写入的记录，用于收尾清理
         self.log("会话已创建", "info")
 
     # ---- 日志 ---- #
@@ -93,7 +98,17 @@ class Session:
                 "key_type": self.config.get("key_type", "ec256"),
                 "http_port": self.config.get("http_port", 80),
                 "webroot": self.config.get("webroot", ""),
+                "dns_provider": self.config.get("dns_provider", "manual"),
             },
+            "dns_records": [
+                {
+                    "name": r.get("name", ""),
+                    "zone": r.get("zone", ""),
+                    "rr": r.get("rr", ""),
+                    "created": r.get("created", False),
+                }
+                for r in self.dns_records
+            ],
             "preflight": self.preflight,
             "challenges": self.challenges,
             "order_status": self.order.get("status") if self.order else None,
@@ -231,6 +246,10 @@ def _start_order(sess: Session, preflight: dict) -> None:
     challenge_type = cfg["challenge"]
     domains = cfg["domains"]
 
+    # 换新订单时，上一轮写入的记录已经没有意义，先清掉
+    if sess.dns_records:
+        action_cleanup_dns(sess, quiet=True)
+
     # ---------- 创建订单 ---------- #
     order_url, order = client.new_order(domains)
     sess.order_url, sess.order = order_url, order
@@ -347,6 +366,15 @@ def _start_order(sess: Session, preflight: dict) -> None:
         else:
             sess.log("未填写网站根目录，请按界面提示手动创建验证文件", "info")
 
+    # ---------- 自动写入 DNS 记录 ---------- #
+    if dns_auto_enabled(sess):
+        try:
+            action_write_dns(sess)
+        except Exception:
+            # 只写了一半就失败：把已经建好的记录收回去，避免留下垃圾
+            action_cleanup_dns(sess, quiet=True)
+            raise
+
 
 def action_validate(sess: Session) -> None:
     if sess.state not in ("prepared", "validated"):
@@ -387,8 +415,10 @@ def action_validate(sess: Session) -> None:
             "请按最新的验证文件 / TXT 记录重新操作，然后再点「开始验证」。"
         )
 
-    # DNS 模式下先检查记录是否生效，避免浪费验证次数
-    if sess.config["challenge"] == "dns":
+    # 记录是否生效：自动写记录时以权威服务器为准，手动模式退回公共 DNS 查询
+    if dns_auto_enabled(sess):
+        _wait_dns_records(sess, pending)
+    elif sess.config["challenge"] == "dns":
         for c in pending:
             values = acme.doh_query(c["dns_name"], "TXT") or []
             if c["dns_value"] in values:
@@ -398,37 +428,43 @@ def action_validate(sess: Session) -> None:
                     f"DNS 记录尚未查询到：{c['dns_name']}（可能仍在传播中，继续尝试验证）", "warn"
                 )
 
-    sess.log("向 CA 提交验证请求…", "info")
-    for c in pending:
-        try:
-            sess.client.trigger_challenge(c["challenge_url"])
-        except acme.AcmeError as exc:
-            c["error"] = exc.message
-            sess.log(f"{c['domain']} 触发验证失败：{exc.message}", "error")
+    try:
+        sess.log("向 CA 提交验证请求…", "info")
+        for c in pending:
+            try:
+                sess.client.trigger_challenge(c["challenge_url"])
+            except acme.AcmeError as exc:
+                c["error"] = exc.message
+                sess.log(f"{c['domain']} 触发验证失败：{exc.message}", "error")
 
-    for c in pending:
-        try:
-            authz = acme.poll_authorization(sess.client, c["authz_url"], timeout=120)
-            c["status"] = authz.get("status")
-            if authz.get("status") == "valid":
-                c["error"] = None
-                sess.log(f"{c['domain']} 验证通过", "ok")
-            else:
-                c["error"] = acme.challenge_error(authz)
-                sess.log(f"{c['domain']} 验证失败：{c['error']}", "error")
-        except acme.AcmeError as exc:
-            c["error"] = exc.message
-            c["status"] = "timeout"
-            sess.log(f"{c['domain']} 验证未完成：{exc.message}", "error")
+        for c in pending:
+            try:
+                authz = acme.poll_authorization(sess.client, c["authz_url"], timeout=120)
+                c["status"] = authz.get("status")
+                if authz.get("status") == "valid":
+                    c["error"] = None
+                    sess.log(f"{c['domain']} 验证通过", "ok")
+                else:
+                    c["error"] = acme.challenge_error(authz)
+                    sess.log(f"{c['domain']} 验证失败：{c['error']}", "error")
+            except acme.AcmeError as exc:
+                c["error"] = exc.message
+                c["status"] = "timeout"
+                sess.log(f"{c['domain']} 验证未完成：{exc.message}", "error")
 
-    failed = [c for c in sess.challenges if c["status"] != "valid"]
-    if failed:
-        sess.state = "prepared"
-        raise acme.AcmeError(
-            "部分域名验证未通过：" + "；".join(f"{c['domain']}（{c['error'] or c['status']}）" for c in failed)
-        )
+        failed = [c for c in sess.challenges if c["status"] != "valid"]
+        if failed:
+            sess.state = "prepared"
+            raise acme.AcmeError(
+                "部分域名验证未通过：" + "；".join(f"{c['domain']}（{c['error'] or c['status']}）" for c in failed)
+            )
 
-    sess.state = "validated"
+        sess.state = "validated"
+    finally:
+        # 验证结束（无论成败）记录都不再有价值：成功即可删，失败也是单次有效
+        if dns_auto_enabled(sess):
+            action_cleanup_dns(sess)
+
     if sess.http_server:
         sess.http_server.stop()
         sess.log("验证通过，已关闭临时验证服务", "info")
@@ -515,23 +551,46 @@ def action_finalize(sess: Session) -> None:
 
 
 def action_check_dns(sess: Session) -> dict:
-    """检查 DNS-01 的 TXT 记录是否已经全网可见。"""
+    """检查 TXT 记录是否已经生效。
+
+    自动写记录的会话优先问权威服务器（不受递归缓存影响），手动模式仍用 DoH。
+    """
+    auto = (sess.config.get("dns_provider") or "manual") != "manual"
     results = []
     for c in sess.challenges:
         if not c["dns_name"]:
             continue
-        values = acme.doh_query(c["dns_name"], "TXT")
-        if values is None:
-            results.append({"domain": c["domain"], "dns_name": c["dns_name"], "state": "unknown",
-                            "found": [], "expected": c["dns_value"]})
-            continue
-        results.append({
+        item = {
             "domain": c["domain"],
             "dns_name": c["dns_name"],
-            "state": "ok" if c["dns_value"] in values else "pending",
-            "found": values,
             "expected": c["dns_value"],
-        })
+            "found": [],
+            "source": "authoritative" if auto else "public",
+            "detail": "",
+        }
+        if auto:
+            try:
+                info = dns_check.authoritative_txt(c["dns_name"])
+            except DnsError as exc:
+                item.update({"state": "unknown", "detail": exc.readable()})
+                results.append(item)
+                continue
+            item["found"] = info["values"]
+            item["detail"] = "；".join(
+                f"{s['ns']}：{'不可达' if s['error'] else '%d 条' % len(s['values'])}"
+                for s in info["servers"]
+            )
+            item["state"] = "ok" if c["dns_value"] in info["values"] else "pending"
+        else:
+            values = acme.doh_query(c["dns_name"], "TXT")
+            if values is None:
+                item.update({"state": "unknown", "detail": "公共 DNS 查询失败"})
+                results.append(item)
+                continue
+            item["found"] = values
+            item["state"] = "ok" if c["dns_value"] in values else "pending"
+        results.append(item)
+
     ok = all(r["state"] == "ok" for r in results) if results else False
     sess.log(
         "DNS 记录检查：" + ("全部已生效" if ok else "部分记录尚未生效"),
@@ -541,11 +600,145 @@ def action_check_dns(sess: Session) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 自动写入解析记录（DNS-01 免手工）
+# --------------------------------------------------------------------------- #
+
+def dns_provider_name(sess: Session) -> str:
+    return (sess.config.get("dns_provider") or "manual").strip()
+
+
+def dns_auto_enabled(sess: Session) -> bool:
+    return dns_provider_name(sess) not in ("", "manual")
+
+
+def _dns_client(sess: Session):
+    if sess.dns_client is None:
+        cfg = sess.config
+        sess.dns_client = create_dns_provider(
+            dns_provider_name(sess),
+            cfg.get("dns_access_key_id", ""),
+            cfg.get("dns_access_key_secret", ""),
+        )
+    return sess.dns_client
+
+
+def _remember_record(sess: Session, record: dict) -> None:
+    for existing in sess.dns_records:
+        if existing.get("record_id") and existing["record_id"] == record.get("record_id"):
+            existing.update(record)
+            return
+        if not record.get("record_id") and existing.get("name") == record.get("name"):
+            existing.update(record)
+            return
+    sess.dns_records.append(record)
+
+
+def action_write_dns(sess: Session) -> int:
+    """把当前订单需要的 TXT 记录写到云解析。返回写入条数。"""
+    pending = [c for c in sess.challenges if c.get("dns_name") and c["status"] != "valid"]
+    if not pending:
+        return 0
+
+    provider = _dns_client(sess)
+    label = provider_label(dns_provider_name(sess))
+    ttl = int(sess.config.get("dns_ttl") or 600)
+    sess.log(f"向{label}写入 {len(pending)} 条 TXT 记录", "info")
+
+    try:
+        zones = provider.zones()
+    except DnsError as exc:
+        raise acme.AcmeError(f"读取托管域名失败：{exc.readable()}")
+    sess.log(f"账号下托管域名共 {len(zones)} 个，开始定位记录所属域名", "info")
+
+    for c in pending:
+        try:
+            info = provider.ensure_txt(c["dns_name"], c["dns_value"], ttl=ttl)
+        except DnsError as exc:
+            raise acme.AcmeError(f"写入解析记录失败：{exc.readable()}")
+        c["dns_auto"] = True
+        c["dns_zone"] = info["zone"]
+        c["dns_record_id"] = info["record_id"]
+        _remember_record(sess, {
+            "name": c["dns_name"],
+            "zone": info["zone"],
+            "rr": info["rr"],
+            "record_id": info["record_id"],
+            "created": info["created"],
+            "domain": c["domain"],
+        })
+        if info["created"]:
+            sess.log(f"已添加 TXT：{c['dns_name']}（{info['zone']} / {info['rr']}）", "ok")
+        else:
+            sess.log(f"已存在同值记录，直接复用：{c['dns_name']}", "info")
+    return len(pending)
+
+
+def _wait_dns_records(sess: Session, pending: list[dict]) -> None:
+    """等权威服务器能查到记录，再提交验证。"""
+    timeout = float(sess.config.get("dns_wait") or 180)
+    # 通配符与裸域会落在同一个记录名上，按名字归并，一次等齐所有期望值
+    targets: dict[str, list[str]] = {}
+    for c in pending:
+        if not c.get("dns_auto") or not c.get("dns_name"):
+            continue
+        targets.setdefault(c["dns_name"], []).append(c["dns_value"])
+
+    missing: list[str] = []
+    for name, values in targets.items():
+        sess.log(f"等待 {name} 在权威服务器上生效（最多 {int(timeout)} 秒）", "info")
+        ok, detail = dns_check.wait_for_txt(name, values, timeout=timeout, log=sess.log)
+        for c in pending:
+            if c.get("dns_name") == name:
+                c["dns_visible"] = ok
+        if ok:
+            sess.log(f"{name} 已生效", "ok")
+            continue
+        missing.append(name)
+        servers = detail.get("servers") or []
+        if servers:
+            sess.log(
+                "未生效的服务器："
+                + "；".join(
+                    f"{s['ns']}（{'不可达' if s['error'] else '无该值'}）" for s in servers
+                ),
+                "warn",
+            )
+    if missing:
+        raise acme.AcmeError(
+            "TXT 记录尚未在权威服务器生效，为避免浪费验证次数，暂未提交验证："
+            + "、".join(missing)
+            + "。记录已保留，可稍等几十秒后重新点击「开始验证」；"
+            "若长时间不生效，请检查域名的 NS 是否确实指向该解析服务商。"
+        )
+
+
+def action_cleanup_dns(sess: Session, quiet: bool = False) -> int:
+    """删除本会话写入的记录。失败只告警，不中断主流程。"""
+    records = list(sess.dns_records)
+    if not records:
+        return 0
+    provider = sess.dns_client
+    removed = 0
+    for record in records:
+        try:
+            provider.delete_record(record.get("record_id", ""))
+            removed += 1
+        except Exception as exc:
+            message = getattr(exc, "message", str(exc))
+            sess.log(f"清理 {record.get('name', '')} 失败：{message}", "warn")
+    sess.dns_records = []
+    if removed and not quiet:
+        sess.log(f"已清理 {removed} 条临时 TXT 记录", "info")
+    return removed
+
+
+# --------------------------------------------------------------------------- #
 # 阿里云 ALB 部署（界面后端）
 # --------------------------------------------------------------------------- #
 
 DEPLOY_DIR = BASE_DIR / "deploy"
 ALB_ENV_FILE = DATA_DIR / "alb.env"
+DNS_ENV_FILE = DATA_DIR / "dns.env"
 
 _ALBD = None
 DEPLOY_SERIAL = threading.Lock()
@@ -654,65 +847,66 @@ def list_cert_bundles() -> list:
     return items
 
 
-def read_saved_credential() -> dict:
-    """只回传掩码后的 AK，绝不把 Secret 送到前端。"""
-    if not ALB_ENV_FILE.is_file():
-        return {"saved": False, "masked": "", "updated_at": ""}
-
-    pairs = {}
+def _read_env_pairs(path: Path) -> dict:
+    pairs: dict[str, str] = {}
     try:
-        for line in ALB_ENV_FILE.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             pairs[k.strip()] = v.strip().strip('"').strip("'")
     except Exception:
+        return {}
+    return pairs
+
+
+def read_saved_credential(path: Path | None = None) -> dict:
+    """只回传掩码后的 AK，绝不把 Secret 送到前端。"""
+    target = path or ALB_ENV_FILE
+    if not target.is_file():
         return {"saved": False, "masked": "", "updated_at": ""}
 
+    pairs = _read_env_pairs(target)
     ak = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "") or pairs.get("ACCESS_KEY_ID", "")
     sk = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "") or pairs.get("ACCESS_KEY_SECRET", "")
     if not ak or not sk:
         return {"saved": False, "masked": "", "updated_at": ""}
 
     try:
-        stamp = datetime.datetime.fromtimestamp(ALB_ENV_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        stamp = datetime.datetime.fromtimestamp(target.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
     except Exception:
         stamp = ""
     masked = (ak[:4] + "***" + ak[-4:]) if len(ak) > 8 else "***"
     return {"saved": True, "masked": masked, "updated_at": stamp}
 
 
-def load_saved_secret() -> tuple:
+def load_saved_secret(path: Path | None = None) -> tuple:
     """取回完整凭证，仅在服务端内部用于发起请求。"""
-    if not ALB_ENV_FILE.is_file():
+    target = path or ALB_ENV_FILE
+    if not target.is_file():
         return "", ""
-    pairs = {}
-    try:
-        for line in ALB_ENV_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            pairs[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception:
-        return "", ""
+    pairs = _read_env_pairs(target)
     ak = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "") or pairs.get("ACCESS_KEY_ID", "")
     sk = pairs.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "") or pairs.get("ACCESS_KEY_SECRET", "")
     return ak, sk
 
 
-def save_credential(ak: str, sk: str) -> None:
+def save_credential(ak: str, sk: str, path: Path | None = None,
+                    comment: str = "") -> None:
+    target = path or ALB_ENV_FILE
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    text = (
+    header = comment or (
         "# 阿里云 RAM 凭证 —— 本文件位于 data/ 下，已被 .gitignore 排除，请勿提交到仓库。\n"
         "# 建议使用仅授予 ALB/CAS 相关动作的子账号，不要使用主账号 AccessKey。\n"
-        "ALIBABA_CLOUD_ACCESS_KEY_ID=%s\n"
-        "ALIBABA_CLOUD_ACCESS_KEY_SECRET=%s\n" % (ak, sk)
     )
-    ALB_ENV_FILE.write_text(text, encoding="utf-8")
+    text = (
+        "%sALIBABA_CLOUD_ACCESS_KEY_ID=%s\n"
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET=%s\n" % (header, ak, sk)
+    )
+    target.write_text(text, encoding="utf-8")
     try:
-        os.chmod(ALB_ENV_FILE, 0o600)
+        os.chmod(target, 0o600)
     except Exception:
         pass
 
@@ -728,6 +922,23 @@ def resolve_deploy_credential(body: dict) -> tuple:
         if saved_ak and saved_sk:
             return saved_ak, saved_sk
     raise acme.AcmeError("缺少 AccessKey：请填写 AccessKey ID 与 Secret，或勾选使用已保存的凭证")
+
+
+def resolve_dns_credential(body: dict, required: bool = True) -> tuple:
+    """解析自动写解析用的凭证；与部署凭证分开存放，便于分配给权限更小的子账号。"""
+    ak = (body.get("dns_access_key_id") or body.get("access_key_id") or "").strip()
+    sk = (body.get("dns_access_key_secret") or body.get("access_key_secret") or "").strip()
+    if ak and sk:
+        return ak, sk
+    if body.get("use_saved", True):
+        saved_ak, saved_sk = load_saved_secret(DNS_ENV_FILE)
+        if saved_ak and saved_sk:
+            return saved_ak, saved_sk
+    if not required:
+        return "", ""
+    raise acme.AcmeError(
+        "缺少云解析 AccessKey：自动写入 TXT 记录需要一个具备云解析权限的 RAM 子账号"
+    )
 
 
 def _deploy_argv(params: dict) -> list:
@@ -890,6 +1101,85 @@ def probe_aliyun(ak: str, sk: str, region: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 配置校验（Web 与命令行共用）
+# --------------------------------------------------------------------------- #
+
+def build_config(body: dict) -> dict:
+    domains = acme.normalize_domains(body.get("domains") or "")
+    email = (body.get("email") or "").strip()
+    if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise acme.AcmeError("邮箱格式不正确（用于接收证书到期提醒，可留空）")
+
+    challenge = body.get("challenge") or "http_auto"
+    if challenge not in ("http_auto", "http_manual", "dns"):
+        raise acme.AcmeError("未知的验证方式")
+    if challenge in ("http_auto", "http_manual") and any(d.startswith("*.") for d in domains):
+        raise acme.AcmeError("通配符域名只能使用 DNS 验证方式")
+
+    # 注意：*.example.com 不覆盖 example.com，两者可同时申请，不能去重
+
+    dns_provider = (body.get("dns_provider") or "manual").strip().lower()
+    if dns_provider in ("", "off", "none", "false", "0"):
+        dns_provider = "manual"
+    if dns_provider not in ("manual", "aliyun"):
+        raise acme.AcmeError(f"暂不支持的解析服务商：{dns_provider}")
+    if dns_provider != "manual" and challenge != "dns":
+        raise acme.AcmeError("自动写入解析记录只能配合「DNS 验证」使用")
+
+    dns_ak = dns_sk = ""
+    dns_ttl = 600
+    try:
+        dns_wait = int(body.get("dns_wait") or 180)
+    except Exception:
+        dns_wait = 180
+    if not (30 <= dns_wait <= 900):
+        raise acme.AcmeError("等待解析生效的时间应在 30-900 秒之间")
+
+    if dns_provider != "manual":
+        dns_ak, dns_sk = resolve_dns_credential(body)
+        if len(dns_ak) < 12 or len(dns_sk) < 16:
+            raise acme.AcmeError(
+                "AccessKey 长度异常，请确认已完整粘贴（ID 通常 24 位，Secret 通常 30 位）"
+            )
+        try:
+            dns_ttl = max(600, int(body.get("dns_ttl") or 600))
+        except Exception:
+            dns_ttl = 600
+
+    key_type = body.get("key_type") or "ec256"
+    if key_type not in ("ec256", "ec384", "rsa2048", "rsa4096"):
+        raise acme.AcmeError("未知的密钥类型")
+
+    try:
+        http_port = int(body.get("http_port") or 80)
+    except Exception:
+        http_port = 80
+    if not (1 <= http_port <= 65535):
+        raise acme.AcmeError("端口号必须在 1-65535 之间")
+
+    staging = bool(body.get("staging"))
+    directory_url = body.get("directory_url") or (
+        acme.STAGING_DIRECTORY if staging else acme.PRODUCTION_DIRECTORY
+    )
+
+    return {
+        "domains": domains,
+        "email": email,
+        "challenge": challenge,
+        "staging": staging,
+        "key_type": key_type,
+        "http_port": http_port,
+        "webroot": (body.get("webroot") or "").strip(),
+        "directory_url": directory_url,
+        "dns_provider": dns_provider,
+        "dns_access_key_id": dns_ak,
+        "dns_access_key_secret": dns_sk,
+        "dns_ttl": dns_ttl,
+        "dns_wait": dns_wait,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # HTTP 处理
 # --------------------------------------------------------------------------- #
 
@@ -989,6 +1279,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/deploy/credential":
             self._ok(read_saved_credential())
             return
+        if path == "/api/dns/credential":
+            self._ok(read_saved_credential(DNS_ENV_FILE))
+            return
+        if path == "/api/dns/meta":
+            self._ok({
+                "providers": [
+                    {"name": "aliyun", "label": provider_label("aliyun"),
+                     "hint": "域名的 NS 需指向阿里云云解析"},
+                ],
+                "credential": read_saved_credential(DNS_ENV_FILE),
+            })
+            return
         m = re.match(r"^/api/deploy/runs/([A-Za-z0-9_-]+)$", path)
         if m:
             job = DEPLOY_JOBS.get(m.group(1))
@@ -1039,6 +1341,37 @@ class Handler(BaseHTTPRequestHandler):
             self._ok(read_saved_credential())
             return
 
+        if path == "/api/dns/credential":
+            ak = (body.get("dns_access_key_id") or body.get("access_key_id") or "").strip()
+            sk = (body.get("dns_access_key_secret") or body.get("access_key_secret") or "").strip()
+            if not ak or not sk:
+                raise acme.AcmeError("AccessKey ID 与 Secret 都不能为空")
+            if len(ak) < 12 or len(sk) < 16:
+                raise acme.AcmeError("AccessKey 长度异常，请确认已完整粘贴（ID 通常 24 位，Secret 通常 30 位）")
+            save_credential(
+                ak, sk, DNS_ENV_FILE,
+                "# 云解析凭证 —— 仅用于 DNS-01 自动写入 TXT 记录，已被 .gitignore 排除。\n"
+                "# 建议单独创建子账号，只授予 alidns 的 Add/Delete/Describe 权限，不要与部署凭证共用。\n",
+            )
+            self._ok(read_saved_credential(DNS_ENV_FILE))
+            return
+
+        if path == "/api/dns/credential/clear":
+            if DNS_ENV_FILE.is_file():
+                DNS_ENV_FILE.unlink()
+            self._ok(read_saved_credential(DNS_ENV_FILE))
+            return
+
+        if path == "/api/dns/zones":
+            ak, sk = resolve_dns_credential(body)
+            provider = create_dns_provider("aliyun", ak, sk)
+            try:
+                zones = [z["name"] for z in provider.zones()]
+            except DnsError as exc:
+                raise acme.AcmeError(exc.readable())
+            self._ok({"count": len(zones), "zones": zones[:50]})
+            return
+
         if path == "/api/deploy/probe":
             ak, sk = resolve_deploy_credential(body)
             region = (body.get("region") or "cn-hangzhou").strip()
@@ -1085,7 +1418,7 @@ class Handler(BaseHTTPRequestHandler):
             self._ok(sess.to_dict())
             return
 
-        m = re.match(r"^/api/sessions/([A-Za-z0-9_-]+)/(prepare|validate|finalize|check-dns|stop-http)$", path)
+        m = re.match(r"^/api/sessions/([A-Za-z0-9_-]+)/(prepare|validate|finalize|check-dns|stop-http|dns-write|dns-cleanup)$", path)
         if not m:
             self._fail("未找到该地址", 404)
             return
@@ -1113,6 +1446,15 @@ class Handler(BaseHTTPRequestHandler):
                     sess.http_server.stop()
                     sess.log("已手动关闭临时验证服务", "info")
                 self._ok(sess.to_dict())
+            elif action == "dns-write":
+                if not dns_auto_enabled(sess):
+                    raise acme.AcmeError("当前会话没有启用自动写入解析记录")
+                count = action_write_dns(sess)
+                sess.log(f"已确认 {count} 条 TXT 记录就位", "ok")
+                self._ok(sess.to_dict())
+            elif action == "dns-cleanup":
+                removed = action_cleanup_dns(sess)
+                self._ok({"removed": removed, "session": sess.to_dict()})
         except acme.AcmeError as exc:
             sess.error = {"message": exc.message, "details": exc.details, "type": exc.problem_type}
             sess.log(exc.message, "error")
@@ -1125,45 +1467,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 配置校验 ---- #
     def _build_config(self, body: dict) -> dict:
-        domains = acme.normalize_domains(body.get("domains") or "")
-        email = (body.get("email") or "").strip()
-        if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-            raise acme.AcmeError("邮箱格式不正确（用于接收证书到期提醒，可留空）")
-
-        challenge = body.get("challenge") or "http_auto"
-        if challenge not in ("http_auto", "http_manual", "dns"):
-            raise acme.AcmeError("未知的验证方式")
-        if challenge in ("http_auto", "http_manual") and any(d.startswith("*.") for d in domains):
-            raise acme.AcmeError("通配符域名只能使用 DNS 验证方式")
-
-        # 注意：*.example.com 不覆盖 example.com，两者可同时申请，不能去重
-
-        key_type = body.get("key_type") or "ec256"
-        if key_type not in ("ec256", "ec384", "rsa2048", "rsa4096"):
-            raise acme.AcmeError("未知的密钥类型")
-
-        try:
-            http_port = int(body.get("http_port") or 80)
-        except Exception:
-            http_port = 80
-        if not (1 <= http_port <= 65535):
-            raise acme.AcmeError("端口号必须在 1-65535 之间")
-
-        staging = bool(body.get("staging"))
-        directory_url = body.get("directory_url") or (
-            acme.STAGING_DIRECTORY if staging else acme.PRODUCTION_DIRECTORY
-        )
-
-        return {
-            "domains": domains,
-            "email": email,
-            "challenge": challenge,
-            "staging": staging,
-            "key_type": key_type,
-            "http_port": http_port,
-            "webroot": (body.get("webroot") or "").strip(),
-            "directory_url": directory_url,
-        }
+        return build_config(body)
 
     # ---- 文件 ---- #
     def _serve_file(self, path: Path):

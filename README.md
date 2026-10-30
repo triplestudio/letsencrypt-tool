@@ -36,6 +36,8 @@ CA 要确认域名确实归你所有，三种方式只是「如何证明」不�
 
 三种方式都能签出同样的证书，只是验证途径不同。
 
+DNS 验证还有个附加选项：域名托管在**阿里云云解析**时，可以打开「自动写入解析记录」，由工具调用云解析 API 添加并清理 `_acme-challenge` 记录，不需要手动复制。见 [DNS 记录自动化](./docs/dns-auto-alibaba.md)。
+
 ---
 
 ## 操作流程
@@ -56,6 +58,11 @@ CA 要确认域名确实归你所有，三种方式只是「如何证明」不�
 
 **DNS**：到域名解析控制台按表格添加 TXT 记录，主机记录 `_acme-challenge`，值照抄。
 解析生效通常 1–10 分钟，可以点「检测解析是否生效」先确认一遍。
+
+域名在阿里云云解析时，可以打开「自动写入解析记录」，填一个有云解析权限的 RAM 子账号
+AccessKey，工具会自己添加记录、等权威服务器可见后再提交验证，验证结束自动删除。
+凭证保存在 `data/dns.env`（与部署凭证分开），权限只需 `alidns` 的 Describe / Add / Delete。
+详见 [DNS 记录自动化](./docs/dns-auto-alibaba.md)。
 
 > 验证失败后原授权会作废，再次点「开始验证」时工具会自动创建新订单并给出新的验证值，
 > 按界面最新内容重新操作即可。
@@ -80,8 +87,11 @@ CA 要确认域名确实归你所有，三种方式只是「如何证明」不�
 
 ## 关于续期
 
-Let's Encrypt 证书有效期 **90 天**，建议每 60 天续期一次。本工具不做自动续期，
-需要用新证书时重新运行一次、申请相同域名，再用新文件覆盖旧文件并重载服务：
+Let's Encrypt 证书有效期 **90 天**。
+
+### 方式一：手工续期（任何场景）
+
+重新申请相同域名，用新文件覆盖旧文件并重载服务：
 
 ```bash
 nginx -t && nginx -s reload          # Nginx
@@ -89,7 +99,52 @@ systemctl reload apache2             # Apache
 iisreset /restart                    # IIS（或在管理器里重新绑定）
 ```
 
-需要全自动续期的话，可以用系统的计划任务定时跑本工具，或改用 certbot / acme.sh。
+### 方式二：一条命令（域名解析和负载都在阿里云）
+
+这是本工具最顺的路径——**不需要复制 TXT 记录，也不需要手工上传证书**：
+
+```bash
+python issue.py --domains "*.example.com,example.com" --dns aliyun --deploy
+```
+
+它依次完成：下单 → 用 RAM 账号往云解析写 `_acme-challenge` TXT → 等权威 DNS 生效 →
+验证 → 签发落盘 → 清理 TXT → 上传到 CAS → 挂到 ALB 监听。全程无交互。
+
+- 监听从 `data/alb-state.json` 自动推断（该域名部署过一次之后就记住了）
+- 首次部署、或想指定别的监听，加 `--listener-id lsn-xxxxxxxxxxxx`（可重复）
+- 想部署后立刻验证链路，加 `--verify-host www.example.com`
+
+### 方式三：计划任务（真正的自动续期）
+
+双击 `register-task.bat` 即可注册（默认每天 03:30，只托管 `*.hnjs888.com`）。
+需要注销后也继续运行，就右键"以管理员身份运行"并带 `/system` 参数走 SYSTEM 账户。
+
+脚本会先走 `Register-ScheduledTask`（CIM）；如果这台机器的 CIM 通道报
+`0x80004005 未指定的错误`，会自动改写任务 XML 并改用 `schtasks /Create /XML`（RPC）重试。
+两条都不通时，XML 会保留在 `%TEMP%\LetsEncrypt-Renew.xml`，可在任务计划程序里
+「导入任务」直接载入。
+
+脚本会开启三个容易被忽略但很关键的设置：**错过计划时间后补跑**（半夜关机不会漏）、
+**电池供电也运行**（笔记本默认不跑）、**不并发启动新实例**（避免上一轮还在等 DNS 生效时又起一轮）。
+
+手工注册也可以，但没有上述设置：
+
+```bat
+schtasks /Create /TN "LetsEncrypt-Renew" /TR "D:\ai\letsencrypt-tool\renew.bat --domain \"*.example.com\"" /SC DAILY /ST 03:30 /F
+```
+
+`renew.bat` 每天跑一次，只有**剩余天数 ≤ 15** 才真正签发并部署，其余时候只读
+`certs/*/cert-info.json` 然后退出，不发任何网络请求。日志按天写在 `data/logs/renew-YYYYMMDD.log`。
+
+关键行为：
+
+- **先签后换**——签发失败时线上证书一个字节都不动，不会出现证书空窗
+- 域名集合沿用旧证书的 SAN，不会因为漏写裸域而导致续期后 SAN 变少
+- 测试环境（`--staging`）签出的证书会被忽略，不会让正式证书被误判成"还有 90 天"
+- 阈值可调：`renew.bat --days 20`；强制重签：`--force`；只看判断：`--dry-run`
+
+> 前提：`data/dns.env` 里要有云解析权限的子账号，`data/alb.env` 里要有 ALB 权限的子账号。
+> 两个账号分开更安全——签发只碰解析，部署只碰负载。
 
 ---
 
@@ -135,14 +190,21 @@ IIS 需要 `.pfx`，用 OpenSSL 转一下即可（界面里给了完整命令）
 letsencrypt-tool/
 ├── run.bat / run.sh      启动脚本（首次自动装环境）
 ├── app.py                本地 Web 服务与业务流程
+├── issue.py              无人值守签发（--deploy 可直接推上 ALB）
+├── renew.py              到期判断 + 续期 + 部署（供计划任务调用）
+├── renew.bat             计划任务入口（CRLF，勿改成 LF）
 ├── acme_client.py        ACME v2 协议实现（JWS 签名、订单、挑战、签发）
+├── dns_providers/        DNS 记录写入（阿里云云解析，纯标准库）
+│   ├── aliyun.py         RPC 签名与云解析接口
+│   └── check.py          权威 NS 生效检测
 ├── requirements.txt      仅 cryptography 与 certifi
 ├── web/                  界面（index / deploy 两套页面）
 ├── deploy/               阿里云 ALB 证书自动部署（可选，需额外装 SDK）
 │   ├── alb_deploy.py     上传证书并替换监听证书
-│   ├── ram-policy.json   最小权限策略
+│   ├── ram-policy.json   最小权限策略（部署）
+│   ├── ram-policy-dns.json 最小权限策略（云解析）
 │   └── run-alb-deploy.bat
-├── docs/                 文档（证书概念、ALB 部署）
+├── docs/                 文档（证书概念、DNS 自动化、ALB 部署）
 ├── data/accounts/        ACME 账号密钥（已被 .gitignore 排除）
 └── certs/                签发的证书（已被 .gitignore 排除）
 ```
@@ -153,6 +215,9 @@ letsencrypt-tool/
 
 - Python 3.9+
 - 能访问 `acme-v02.api.letsencrypt.org`（走代理时会自动沿用系统 `HTTPS_PROXY`）
+
+自动写 DNS 记录不需要额外依赖：云解析的 RPC 签名用标准库实现，`requirements.txt` 不必改。
+只有部署到 ALB 才需要装阿里云 SDK。
 
 申请正式证书的前提：域名已完成 ICP 备案（国内服务器）、域名解析指向目标机器、80 或 DNS 可正常访问。
 
@@ -169,6 +234,10 @@ letsencrypt-tool/
 - 术语速查表（ACME、order、authorization、challenge、leaf、intermediate…）
 
 需要把证书自动部署到阿里云负载均衡，见 [**把证书自动部署到阿里云 ALB**](./docs/deploy-alibaba-alb.md)：最小权限策略、幂等替换、线上校验、计划任务写法。
+
+想让 DNS-01 验证也不再手工复制，见 [**让工具自己写 DNS 记录**](./docs/dns-auto-alibaba.md)：云解析最小权限、生效判定为什么查权威服务器、临时记录怎么清理、无人值守命令怎么写。
+
+想知道三块拼起来之后闭环长什么样，见 [**从三个断点到一个闭环**](./docs/auto-renew-close-loop.md)（配 [框图](./docs/auto-renew-close-loop.html)）：为什么 15 天窗口而不是每天签发、失败时线上处于什么状态、闭环成立的三个前提条件。
 
 装好 SDK 后，签发完成页会多出一个「部署到阿里云 ALB」入口；证书申请页左侧边栏底部也有常驻入口，未签发证书时也能直接进入。也可以在浏览器直接访问 `http://127.0.0.1:8899/deploy`：选证书、填 AccessKey 与监听 ID（可自动读取）、先预演后执行。「预演模式」开关常驻在页面主区域，不折叠在「高级选项」里。命令行与界面完全等价。
 

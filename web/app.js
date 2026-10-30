@@ -14,6 +14,7 @@ const state = {
   logCursor: 0,
   overlayTimer: null,
   overlayStart: 0,
+  dnsMeta: null,
 };
 
 /* ----------------------------- 通用工具 ----------------------------- */
@@ -151,6 +152,64 @@ function syncConditionalFields() {
   const mode = currentChallenge();
   $("#fieldWebroot").classList.toggle("hidden", mode !== "http_manual");
   $("#fieldPort").classList.toggle("hidden", mode !== "http_auto");
+  $("#fieldDnsAuto").classList.toggle("hidden", mode !== "dns");
+}
+
+function syncDnsAuto() {
+  const on = $("#dnsAuto").checked;
+  $("#dnsCredBox").classList.toggle("hidden", !on);
+  $("#dnsAutoCard").classList.toggle("is-on", on);
+  $("#dnsAutoDesc").textContent = on
+    ? "记录由工具写入并在验证后自动删除；域名的 NS 必须指向阿里云云解析。"
+    : "开启后由工具调用云解析接口写入 _acme-challenge 记录，验证结束自动删除，不需要手动复制。";
+}
+
+async function loadDnsMeta() {
+  try {
+    const meta = await api("/api/dns/meta");
+    state.dnsMeta = meta;
+    const cred = meta.credential || {};
+    if (cred.saved) {
+      $("#dnsSavedHint").textContent = `已保存 ${cred.masked} · ${cred.updated_at}`;
+      $("#dnsUseSaved").checked = true;
+    } else {
+      $("#dnsSavedHint").textContent = "尚未保存过";
+      $("#dnsUseSaved").checked = false;
+    }
+  } catch (e) {
+    /* 读取失败不影响签发 */
+  }
+}
+
+async function probeDns() {
+  const btn = $("#btnDnsProbe");
+  const ak = $("#dnsAk").value.trim();
+  const sk = $("#dnsSk").value.trim();
+  const useSaved = $("#dnsUseSaved").checked;
+  const box = $("#dnsProbeResult");
+  if (!ak && !useSaved) {
+    toast("请先填写 AccessKey，或勾选「使用已保存的云解析凭证」", "error", "缺少凭证");
+    return;
+  }
+  btn.classList.add("is-loading");
+  btn.disabled = true;
+  box.textContent = "正在读取…";
+  try {
+    const data = await api("/api/dns/zones", {
+      dns_access_key_id: ak,
+      dns_access_key_secret: sk,
+      use_saved: useSaved,
+    });
+    const preview = (data.zones || []).slice(0, 3).join("、");
+    box.textContent = `✓ 识别到 ${data.count} 个托管域名：${preview}${data.count > 3 ? " 等" : ""}`;
+    box.style.color = "var(--accent)";
+  } catch (err) {
+    box.textContent = err.message || "读取失败";
+    box.style.color = "var(--danger)";
+  } finally {
+    btn.classList.remove("is-loading");
+    btn.disabled = false;
+  }
 }
 
 function syncEnvBadge() {
@@ -187,6 +246,23 @@ async function submitForm() {
     http_port: Number($("#httpPort").value) || 80,
     webroot: $("#webroot").value.trim(),
   };
+
+  if (body.challenge === "dns" && $("#dnsAuto").checked) {
+    const ak = $("#dnsAk").value.trim();
+    const sk = $("#dnsSk").value.trim();
+    const useSaved = $("#dnsUseSaved").checked;
+    if (!ak && !useSaved) {
+      toast("已开启自动写入解析，但还没有凭证：请填写 AccessKey，或勾选使用已保存的凭证", "error", "缺少云解析凭证");
+      $("#dnsAk").focus();
+      return;
+    }
+    body.dns_provider = "aliyun";
+    body.dns_access_key_id = ak;
+    body.dns_access_key_secret = sk;
+    body.use_saved = useSaved;
+  } else {
+    body.dns_provider = "manual";
+  }
 
   const btn = $("#btnSubmit");
   btn.classList.add("is-loading");
@@ -298,7 +374,10 @@ function renderStep2() {
 
   if (mode === "http_auto") renderAutoGuide(s);
   if (mode === "http_manual") renderManualGuide(s);
-  if (mode === "dns") renderDnsGuide(s);
+  if (mode === "dns") {
+    renderDnsGuide(s);
+    renderDnsAutoStatus(s);
+  }
 
   // 副标题
   const subtitles = {
@@ -307,6 +386,9 @@ function renderStep2() {
     dns: "添加下列 TXT 记录，等解析生效后点击「开始验证」。",
   };
   $("#step2Subtitle").textContent = subtitles[mode] || "";
+  if (mode === "dns" && s.config.dns_provider && s.config.dns_provider !== "manual") {
+    $("#step2Subtitle").textContent = "TXT 记录已自动写入，确认下方明细无误后点击「开始验证」。";
+  }
 
   const pending = (s.challenges || []).some((c) => c.status !== "valid");
   $("#btnValidate").classList.toggle("hidden", noChallenges || !pending);
@@ -396,12 +478,78 @@ async function checkDns() {
     const data = await api(`/api/sessions/${state.session.id}/check-dns`, {});
     const total = data.records.length;
     const ok = data.records.filter((r) => r.state === "ok").length;
+    const source = (data.records[0] || {}).source === "authoritative" ? "权威服务器" : "公共 DNS";
     $("#dnsCheckResult").textContent = ok === total
-      ? `已检测到全部 ${total} 条记录，可以开始验证了。`
-      : `已生效 ${ok} / ${total} 条，请稍等再试（DNS 传播一般需要 1–10 分钟）。`;
+      ? `已检测到全部 ${total} 条记录（来源：${source}），可以开始验证了。`
+      : `已生效 ${ok} / ${total} 条（来源：${source}），请稍等再试。`;
     if (ok === total && total > 0) toast("DNS 记录已全部生效", "ok", "检查通过");
   } catch (err) {
     toast(err.message || "检查失败", "error");
+  } finally {
+    btn.classList.remove("is-loading");
+    btn.disabled = false;
+  }
+}
+
+function renderDnsAutoStatus(s) {
+  const auto = s.config && s.config.dns_provider && s.config.dns_provider !== "manual";
+  const status = $("#dnsAutoStatus");
+  const text = $("#dnsGuideText");
+  const rewrite = $("#btnDnsRewrite");
+  const clean = $("#btnDnsClean");
+
+  if (!auto) {
+    status.classList.add("hidden");
+    rewrite.classList.add("hidden");
+    clean.classList.add("hidden");
+    text.innerHTML =
+      "到域名解析控制台添加下列 <b>TXT 记录</b>（记录类型选 TXT，主机记录填 " +
+      "<code>_acme-challenge</code> 对应的部分，记录值填下面给出的内容）。解析生效通常需要 1&ndash;10 分钟。";
+    return;
+  }
+
+  const records = s.dns_records || [];
+  const created = records.filter((r) => r.created).length;
+  const zones = [...new Set(records.map((r) => r.zone).filter(Boolean))];
+  status.classList.remove("hidden");
+  status.innerHTML =
+    `<div><b>记录已由工具写入</b>${zones.length ? "（" + escapeHtml(zones.join("、")) + "）" : ""}。` +
+    `共 ${records.length} 条，新增 ${created} 条、复用已有 ${records.length - created} 条；` +
+    `验证结束后自动删除，不需要手动清理。</div>` +
+    `<div class="small" style="margin-top:6px">下表为记录明细，供核对用。</div>`;
+  rewrite.classList.remove("hidden");
+  clean.classList.toggle("hidden", records.length === 0);
+  text.innerHTML =
+    "工具会先等权威域名服务器能查到记录，再向 CA 提交验证；通常几秒完成，最长等待约 3 分钟。";
+}
+
+async function writeDnsRecords() {
+  const btn = $("#btnDnsRewrite");
+  btn.classList.add("is-loading");
+  btn.disabled = true;
+  try {
+    state.session = await api(`/api/sessions/${state.session.id}/dns-write`, {});
+    renderStep2();
+    toast("记录已重新写入", "ok");
+  } catch (err) {
+    toast(err.message || "写入失败", "error", "写入失败");
+  } finally {
+    btn.classList.remove("is-loading");
+    btn.disabled = false;
+  }
+}
+
+async function cleanupDnsRecords() {
+  const btn = $("#btnDnsClean");
+  btn.classList.add("is-loading");
+  btn.disabled = true;
+  try {
+    const data = await api(`/api/sessions/${state.session.id}/dns-cleanup`, {});
+    state.session = data.session;
+    renderStep2();
+    toast(`已清理 ${data.removed} 条临时记录`, "ok");
+  } catch (err) {
+    toast(err.message || "清理失败", "error");
   } finally {
     btn.classList.remove("is-loading");
     btn.disabled = false;
@@ -616,6 +764,9 @@ function bind() {
 
   $("#staging").addEventListener("change", syncEnvBadge);
 
+  $("#dnsAuto").addEventListener("change", syncDnsAuto);
+  $("#btnDnsProbe").addEventListener("click", probeDns);
+
   $("#btnSubmit").addEventListener("click", submitForm);
 
   $("#btnBack1").addEventListener("click", () => {
@@ -625,6 +776,8 @@ function bind() {
 
   $("#btnValidate").addEventListener("click", validate);
   $("#btnCheckDns").addEventListener("click", checkDns);
+  $("#btnDnsRewrite").addEventListener("click", writeDnsRecords);
+  $("#btnDnsClean").addEventListener("click", cleanupDnsRecords);
 
   $("#btnRetryPrepare").addEventListener("click", async () => {
     await prepare();
@@ -647,9 +800,11 @@ function bind() {
     $("#webroot").value = "";
     $("#httpPort").value = "80";
     $("#staging").checked = false;
+    $("#dnsSk").value = "";
     renderChips();
     syncEnvBadge();
     syncConditionalFields();
+    syncDnsAuto();
     $("#logLines").innerHTML = `<p class="muted small">暂无日志</p>`;
     $("#logLast").textContent = "等待开始…";
     gotoStep(1);
@@ -709,6 +864,8 @@ function init() {
   renderChips();
   syncConditionalFields();
   syncEnvBadge();
+  syncDnsAuto();
+  loadDnsMeta();
 }
 
 init();
