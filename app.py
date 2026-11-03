@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import acme_client as acme  # noqa: E402
+import renewal_job  # noqa: E402
 from dns_providers import DnsError, provider_label  # noqa: E402
 from dns_providers import check as dns_check  # noqa: E402
 from dns_providers import create as create_dns_provider  # noqa: E402
@@ -745,6 +746,28 @@ DEPLOY_SERIAL = threading.Lock()
 DEPLOY_JOBS: dict[str, "DeployJob"] = {}
 DEPLOY_JOBS_LOCK = threading.Lock()
 
+RENEWAL_LOCK = threading.Lock()
+
+
+def start_renewal_check() -> bool:
+    """界面上的「立即检查」。真正的互斥在 renewal_job 的文件锁里，
+    这里只是避免连点按钮堆出一串线程。
+    """
+    if not RENEWAL_LOCK.acquire(blocking=False):
+        return False
+
+    def worker():
+        try:
+            renewal_job.run_check()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            RENEWAL_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
 EXIT_HINTS = {
     0: "成功",
     1: "本地证书问题",
@@ -1291,6 +1314,18 @@ class Handler(BaseHTTPRequestHandler):
                 "credential": read_saved_credential(DNS_ENV_FILE),
             })
             return
+        if path == "/api/scheduler/status":
+            self._ok(renewal_job.status())
+            return
+        if path == "/api/scheduler/logs":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            kind = (qs.get("kind") or ["renew"])[0]
+            date = (qs.get("date") or [""])[0]
+            if kind == "scheduler":
+                self._ok({"kind": "scheduler", **renewal_job.read_scheduler_log()})
+            else:
+                self._ok({"kind": "renew", **renewal_job.read_renew_log(date)})
+            return
         m = re.match(r"^/api/deploy/runs/([A-Za-z0-9_-]+)$", path)
         if m:
             job = DEPLOY_JOBS.get(m.group(1))
@@ -1408,6 +1443,11 @@ class Handler(BaseHTTPRequestHandler):
 
             threading.Thread(target=worker, daemon=True).start()
             self._ok(job.to_dict())
+            return
+
+        if path == "/api/scheduler/check":
+            started = start_renewal_check()
+            self._ok({"started": started, "status": renewal_job.status()})
             return
 
         if path == "/api/sessions":

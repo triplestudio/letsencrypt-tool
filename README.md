@@ -114,27 +114,69 @@ python issue.py --domains "*.example.com,example.com" --dns aliyun --deploy
 - 首次部署、或想指定别的监听，加 `--listener-id lsn-xxxxxxxxxxxx`（可重复）
 - 想部署后立刻验证链路，加 `--verify-host www.example.com`
 
-### 方式三：计划任务（真正的自动续期）
+### 方式三：常驻调度器（真正的自动续期）
 
-双击 `register-task.bat` 即可注册（默认每天 03:30，只托管 `*.hnjs888.com`）。
-需要注销后也继续运行，就右键"以管理员身份运行"并带 `/system` 参数走 SYSTEM 账户。
+没有用 Windows 计划任务。它的执行时刻是固定的，而机器凌晨往往关着；跑没跑、为什么没跑，
+都要去事件查看器里翻，还不一定翻得到。
 
-脚本会先走 `Register-ScheduledTask`（CIM）；如果这台机器的 CIM 通道报
-`0x80004005 未指定的错误`，会自动改写任务 XML 并改用 `schtasks /Create /XML`（RPC）重试。
-两条都不通时，XML 会保留在 `%TEMP%\LetsEncrypt-Renew.xml`，可在任务计划程序里
-「导入任务」直接载入。
-
-脚本会开启三个容易被忽略但很关键的设置：**错过计划时间后补跑**（半夜关机不会漏）、
-**电池供电也运行**（笔记本默认不跑）、**不并发启动新实例**（避免上一轮还在等 DNS 生效时又起一轮）。
-
-手工注册也可以，但没有上述设置：
+这里换成「常驻进程 + 心跳判断」：不要求在某个时刻执行，只在每次醒来时问一句"现在该不该续"。
+15 天窗口配上 6 小时间隔，一轮窗口内有几十次机会，漏掉一次不影响结果。
 
 ```bat
-schtasks /Create /TN "LetsEncrypt-Renew" /TR "D:\ai\letsencrypt-tool\renew.bat --domain \"*.example.com\"" /SC DAILY /ST 03:30 /F
+install-autostart.bat     :: 一次性：加入启动项并立即启动
+start-scheduler.bat       :: 只启动，不碰启动项
+check-status.bat          :: 看它活着吗、上次做了什么、下次什么时候
+stop-scheduler.bat        :: 停止
+uninstall-autostart.bat   :: 移出启动项并停止
 ```
 
-`renew.bat` 每天跑一次，只有**剩余天数 ≤ 15** 才真正签发并部署，其余时候只读
-`certs/*/cert-info.json` 然后退出，不发任何网络请求。日志按天写在 `data/logs/renew-YYYYMMDD.log`。
+**怎么知道它在正常工作**——调度器是用 `pythonw.exe` 起的，没有窗口、没有托盘图标，
+双击 `start-scheduler.bat` 之后屏幕上什么都不会留下，这是正常的。看状态有四个地方：
+
+| 入口 | 看到什么 |
+|---|---|
+| `check-status.bat` | 双击即可：运行中/未运行、上次检查时间与结论、下次检查时间、每张证书剩余天数 |
+| 界面卡片「查看日志」 | 抽屉式面板，把日志按「轮次 → 证书 → 明细」渲染，见下 |
+| 工具页面顶部卡片 | 绿点表示调度器在跑，带「立即检查」按钮 |
+| `data\logs\scheduler.log` | 每次启动、每轮检查、停止都有时间戳记录 |
+| `http://127.0.0.1:8898/health` | 返回 JSON，进程活着才响应；浏览器打不开就是没在跑 |
+
+`check-status.bat` 只是读，不会触发检查，随时可以双击。
+
+界面上的「查看日志」打开后是两个标签页：
+
+- **检查记录**——按天分组，每轮一张证书，配状态徽章（无需续期 / 已续期 / 失败）。
+  明细逐条列出当前文件、到期时间、SAN、判断结论；真正续期时还会显示第一步、第二步，
+  以及部署脚本的原始输出（挂在对应步骤下面，缩进显示）。失败的轮次整条红线贯穿，
+  异常那行标红。可以按日期回看历史。
+- **调度事件**——`scheduler.log` 的事件流：什么时候启动、什么时候心跳、什么时候停止。
+  用来判断"它还在跑吗"，比逐轮明细更短。
+
+`/#logs` 可以直接打开这个面板（方便收藏成书签）。日志只读，不会触发检查；
+按 Esc 或点遮罩关闭。
+
+`install-autostart.bat` 会在当前用户的「启动」文件夹里放一个只含绝对路径的
+`cert-renew-scheduler.bat`，登录后由它拉起 `pythonw.exe`，不弹窗口。要取消就运行
+`uninstall-autostart.bat`，启动项和进程一起清掉。
+
+行为：
+
+- 启动时先检查一次（等价于"开机就补"，比计划任务的补跑更确定），之后每 6 小时一次
+- 首次运行生成 `data/scheduler.json`：`domains`（托管哪些证书）、`threshold_days`（默认 15）、
+  `interval_hours`（默认 6）。按 `certs/` 现有证书初始化，之后由人改
+- 状态写在 `data/renewal-state.json`，界面顶部的「证书自动续期」卡片直接读它：
+  剩余天数、上次结论、下次检查时间，还能点「立即检查」
+- 单实例：占用 `127.0.0.1:8898` 当锁，重复启动的那次报一句就退出
+- 日志：`data/logs/scheduler.log`（调度器自身）、`data/logs/renew-YYYYMMDD.log`（每次检查）
+
+命令行也能直接用：
+
+```bat
+python scheduler.py --report       :: 打印人话版状态
+python scheduler.py --status       :: 打印 JSON 状态（给程序读）
+python scheduler.py --check-now    :: 立刻检查一次
+python scheduler.py --stop         :: 停止
+```
 
 关键行为：
 
@@ -191,8 +233,15 @@ letsencrypt-tool/
 ├── run.bat / run.sh      启动脚本（首次自动装环境）
 ├── app.py                本地 Web 服务与业务流程
 ├── issue.py              无人值守签发（--deploy 可直接推上 ALB）
-├── renew.py              到期判断 + 续期 + 部署（供计划任务调用）
-├── renew.bat             计划任务入口（CRLF，勿改成 LF）
+├── renew.py              到期判断 + 续期 + 部署（被调度器调用）
+├── renew.bat             一次性的手工入口（CRLF，勿改成 LF）
+├── scheduler.py          常驻调度器：心跳判断 + 单实例 + 状态接口
+├── renewal_job.py        检查逻辑（调度器与界面共用，文件锁互斥）
+├── start-scheduler.bat   启动调度器（无窗口）
+├── check-status.bat      查看续期状态（双击即可，只读）
+├── stop-scheduler.bat    停止调度器
+├── install-autostart.bat 加入开机启动项
+├── uninstall-autostart.bat 移出启动项并停止
 ├── acme_client.py        ACME v2 协议实现（JWS 签名、订单、挑战、签发）
 ├── dns_providers/        DNS 记录写入（阿里云云解析，纯标准库）
 │   ├── aliyun.py         RPC 签名与云解析接口
@@ -205,7 +254,9 @@ letsencrypt-tool/
 │   ├── ram-policy-dns.json 最小权限策略（云解析）
 │   └── run-alb-deploy.bat
 ├── docs/                 文档（证书概念、DNS 自动化、ALB 部署）
-├── data/accounts/        ACME 账号密钥（已被 .gitignore 排除）
+├── data/                 凭证、状态与日志（已被 .gitignore 排除）
+│   ├── scheduler.json    托管哪些证书、阈值、间隔
+│   └── renewal-state.json 上次检查结论（界面卡片读它）
 └── certs/                签发的证书（已被 .gitignore 排除）
 ```
 
@@ -233,7 +284,7 @@ letsencrypt-tool/
 - 各服务器到底该配哪两个文件，以及用 openssl 自查证书的 5 条命令
 - 术语速查表（ACME、order、authorization、challenge、leaf、intermediate…）
 
-需要把证书自动部署到阿里云负载均衡，见 [**把证书自动部署到阿里云 ALB**](./docs/deploy-alibaba-alb.md)：最小权限策略、幂等替换、线上校验、计划任务写法。
+需要把证书自动部署到阿里云负载均衡，见 [**把证书自动部署到阿里云 ALB**](./docs/deploy-alibaba-alb.md)：最小权限策略、幂等替换、线上校验。
 
 想让 DNS-01 验证也不再手工复制，见 [**让工具自己写 DNS 记录**](./docs/dns-auto-alibaba.md)：云解析最小权限、生效判定为什么查权威服务器、临时记录怎么清理、无人值守命令怎么写。
 

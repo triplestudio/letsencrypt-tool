@@ -872,3 +872,284 @@ init();
 
 // 暴露内部状态，便于调试与自动化测试（不影响正常使用）
 window.__le = { state, gotoStep, renderStep2, renderStep3, renderDeployCode, renderChips };
+
+/* ============================================================
+   自动续期状态卡
+   ============================================================ */
+
+let renewTimer = 0;
+
+function scheduleRenew(delay) {
+  clearTimeout(renewTimer);
+  renewTimer = setTimeout(loadRenew, delay);
+}
+
+function renderRenew(data) {
+  const card = $("#renewCard");
+  if (!card) return;
+  card.hidden = false;
+
+  const alive = !!(data.scheduler && data.scheduler.running);
+  const busy = !!data.running;
+  const failed = data.last_code !== null && data.last_code !== 0;
+  const dot = $("#renewDot");
+  const badge = $("#renewBadge");
+
+  dot.className = "renew-dot" + (busy || alive ? " is-live" : failed ? " is-bad" : "");
+  badge.className = "renew-badge" + (alive ? " is-live" : "");
+  badge.textContent = busy ? "检查中" : alive ? "调度器运行中" : "调度器未运行";
+
+  const parts = [];
+  if (data.last_check) parts.push("上次检查 <b>" + data.last_check.replace("T", " ") + "</b>");
+  if (data.last_summary) parts.push(escapeHtml(data.last_summary));
+  if (alive && data.next_check) parts.push("下次 <b>" + data.next_check.slice(5, 16).replace("T", " ") + "</b>");
+  if (!alive) parts.push('<span class="renew-todo">双击 start-scheduler.bat 开启自动检查</span>');
+  $("#renewMeta").innerHTML = parts.join(" · ") || "还没有检查记录";
+
+  $("#renewCerts").innerHTML = (data.certs || []).map((c) => {
+    const tone = c.days_left <= 7 ? " is-bad" : c.days_left <= 20 ? " is-warn" : "";
+    return '<span class="renew-cert' + (c.tracked ? "" : " is-off") + '">'
+      + "<b>" + escapeHtml(c.cn) + "</b>"
+      + '<span class="days' + tone + '">剩 ' + c.days_left + " 天</span>"
+      + "<span>" + escapeHtml(c.not_after) + (c.tracked ? "" : "（未纳入）") + "</span>"
+      + "</span>";
+  }).join("");
+
+  const btn = $("#btnRenewCheck");
+  btn.disabled = busy;
+  btn.textContent = busy ? "检查中…" : "立即检查";
+}
+
+async function loadRenew() {
+  try {
+    const data = await api("/api/scheduler/status");
+    renderRenew(data);
+    scheduleRenew(data.running ? 1800 : 60000);
+  } catch (err) {
+    const card = $("#renewCard");
+    if (card) {
+      card.hidden = false;
+      $("#renewBadge").textContent = "读取失败";
+      $("#renewMeta").textContent = (err && err.message) || "无法读取续期状态";
+    }
+    scheduleRenew(60000);
+  }
+}
+
+async function triggerRenewCheck() {
+  const btn = $("#btnRenewCheck");
+  btn.disabled = true;
+  btn.textContent = "检查中…";
+  try {
+    const res = await api("/api/scheduler/check", {});
+    if (!res.started) toast("已有一轮检查正在进行", "warn");
+    scheduleRenew(1200);
+  } catch (err) {
+    toast((err && err.message) || "触发检查失败");
+    btn.disabled = false;
+    btn.textContent = "立即检查";
+  }
+}
+
+const renewBtnEl = $("#btnRenewCheck");
+if (renewBtnEl) renewBtnEl.addEventListener("click", triggerRenewCheck);
+loadRenew();
+
+/* ============================================================
+   续期运行日志抽屉
+   ============================================================ */
+
+const logState = { kind: "renew", date: "", open: false, loading: false };
+
+const STATUS_TEXT = {
+  skip: "无需续期",
+  renewed: "已续期",
+  renewing: "续期中",
+  fail: "失败",
+  check: "已检查",
+};
+
+function fmtDay(yyyymmdd) {
+  if (!yyyymmdd || yyyymmdd.length !== 8) return yyyymmdd;
+  return yyyymmdd.slice(0, 4) + "-" + yyyymmdd.slice(4, 6) + "-" + yyyymmdd.slice(6, 8);
+}
+
+function itemToneClass(item) {
+  if (item.k === "当前文件" || item.k === "SAN") return "t-mono";
+  return "t-" + (item.tone || "normal");
+}
+
+function renderItem(item) {
+  let html = '<div class="lg-item ' + itemToneClass(item) + '">';
+  html += '<span class="k">' + escapeHtml(item.k || "") + "</span>";
+  html += '<div class="v">' + escapeHtml(item.v);
+  if (item.detail && item.detail.length) {
+    html += '<pre class="detail">' + item.detail.map((d) =>
+      '<span class="' + (d.tone === "bad" ? "d-bad" : "") + '">' + escapeHtml(d.text) + "</span>"
+    ).join("\n") + "</pre>";
+  }
+  html += "</div></div>";
+  return html;
+}
+
+function renderRenewLog(data) {
+  if (!data.rounds || !data.rounds.length) {
+    return '<div class="lg-empty">' + escapeHtml(data.empty || "没有记录") + "</div>";
+  }
+
+  let html = '<div class="lg-day">' + escapeHtml(fmtDay(data.date)) + "</div>";
+
+  const c = data.counts || {};
+  const sum = [];
+  if (c.renewed) sum.push("<b>" + c.renewed + "</b> 轮续期");
+  if (c.fail) sum.push("<b>" + c.fail + "</b> 轮失败");
+  if (c.skip) sum.push("<b>" + c.skip + "</b> 轮无需续期");
+  if (sum.length) html += '<div class="lg-sum">' + sum.join(" · ") + "</div>";
+
+  data.rounds.forEach((r) => {
+    const st = r.status || "check";
+    html += '<div class="lg-round s-' + st + '">';
+
+    // 一轮里可能有多张证书，各占一个头
+    (r.certs || []).forEach((cert, i) => {
+      if (i > 0) html += '<div style="height:10px"></div>';
+      html += '<div class="lg-head">';
+      if (i === 0) html += '<span class="lg-time">' + escapeHtml(r.time) + "</span>";
+      else html += '<span class="lg-time">·</span>';
+      html += '<span class="lg-cn">' + escapeHtml(cert.cn) + "</span>";
+      html += '<span class="lg-badge s-' + (cert.status || "check") + '">'
+        + escapeHtml(STATUS_TEXT[cert.status] || "已检查") + "</span>";
+      if (r.dry_run) html += '<span class="lg-badge is-dry">预演</span>';
+      html += "</div>";
+      html += '<div class="lg-items">' + (cert.items || []).map(renderItem).join("") + "</div>";
+    });
+
+    if (r.notes && r.notes.length) {
+      html += '<div class="lg-notes">' + r.notes.map(escapeHtml).join("<br>") + "</div>";
+    }
+    if (r.summary) {
+      html += '<div class="lg-notes' + (st === "fail" ? " is-bad" : "") + '">结束：'
+        + escapeHtml(r.summary) + "</div>";
+    }
+    html += "</div>";
+  });
+
+  if (data.truncated) {
+    html += '<div class="logsheet-more">只显示最近 ' + data.rounds.length + " 轮，更早的记录在日志文件里</div>";
+  }
+  return html;
+}
+
+function renderSchedulerLog(data) {
+  if (!data.entries || !data.entries.length) {
+    return '<div class="lg-empty">' + escapeHtml(data.empty || "没有记录") + "</div>";
+  }
+  let lastDay = "";
+  let html = "";
+  data.entries.forEach((e) => {
+    if (e.date !== lastDay) {
+      if (lastDay) html += '<div style="height:14px"></div>';
+      html += '<div class="lg-day">' + escapeHtml(e.date) + "</div>";
+      lastDay = e.date;
+    }
+    html += '<div class="lg-ev lv-' + (e.level || "normal") + '">'
+      + '<span class="t">' + escapeHtml(e.time) + "</span>"
+      + '<span class="x">' + escapeHtml(e.text) + "</span></div>";
+  });
+  html += '<div class="logsheet-more">最多显示最近 ' + data.entries.length + " 条</div>";
+  return html;
+}
+
+async function loadLogs() {
+  if (logState.loading) return;
+  logState.loading = true;
+  const body = $("#logSheetBody");
+  body.innerHTML = '<div class="lg-empty">读取中…</div>';
+
+  try {
+    const q = logState.kind === "scheduler"
+      ? "/api/scheduler/logs?kind=scheduler"
+      : "/api/scheduler/logs?kind=renew" + (logState.date ? "&date=" + logState.date : "");
+    const data = await api(q);
+
+    if (data.kind === "scheduler") {
+      body.innerHTML = renderSchedulerLog(data);
+      $("#logSheetFoot").textContent = "调度器自己的事件：启动、心跳、停止";
+      $("#logDate").classList.add("is-off");
+    } else {
+      body.innerHTML = renderRenewLog(data);
+      $("#logSheetFoot").textContent = "签发与部署的完整输出在 data\\logs\\renew-" + (data.date || "") + ".log";
+      logState.date = data.date || "";
+      const sel = $("#logDate");
+      sel.innerHTML = (data.dates || []).map((d) =>
+        '<option value="' + d + '"' + (d === data.date ? " selected" : "") + ">" + fmtDay(d) + "</option>"
+      ).join("");
+      sel.classList.toggle("is-off", !(data.dates && data.dates.length > 1));
+    }
+    $("#logSheetSub").textContent = logState.kind === "scheduler"
+      ? "只读，来自 data\\logs\\scheduler.log"
+      : "只读，来自 data\\logs\\renew-" + (logState.date || "YYYYMMDD") + ".log";
+  } catch (err) {
+    body.innerHTML = '<div class="lg-empty">读取失败：' + escapeHtml((err && err.message) || "未知错误") + "</div>";
+  } finally {
+    logState.loading = false;
+  }
+}
+
+function openLogSheet() {
+  const sheet = $("#logSheet");
+  if (!sheet) return;
+  sheet.classList.remove("hidden");
+  logState.open = true;
+  document.body.style.overflow = "hidden";
+  loadLogs();
+}
+
+function closeLogSheet() {
+  const sheet = $("#logSheet");
+  if (!sheet) return;
+  sheet.classList.add("hidden");
+  logState.open = false;
+  document.body.style.overflow = "";
+}
+
+(function bindLogSheet() {
+  const openBtn = $("#btnRenewLog");
+  if (openBtn) openBtn.addEventListener("click", openLogSheet);
+
+  const closeBtn = $("#logSheetClose");
+  if (closeBtn) closeBtn.addEventListener("click", closeLogSheet);
+
+  const mask = $("#logSheetMask");
+  if (mask) mask.addEventListener("click", closeLogSheet);
+
+  const refresh = $("#logRefresh");
+  if (refresh) refresh.addEventListener("click", loadLogs);
+
+  const sel = $("#logDate");
+  if (sel) {
+    sel.addEventListener("change", () => {
+      logState.date = sel.value;
+      loadLogs();
+    });
+  }
+
+  document.querySelectorAll(".logsheet-tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".logsheet-tab").forEach((t) => t.classList.remove("is-on"));
+      tab.classList.add("is-on");
+      logState.kind = tab.dataset.kind;
+      logState.date = "";
+      loadLogs();
+    });
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && logState.open) closeLogSheet();
+  });
+
+  // 支持 /#logs 直达：状态卡还在读时先等一下
+  if (location.hash === "#logs") {
+    setTimeout(openLogSheet, 400);
+  }
+})();

@@ -70,6 +70,20 @@
     <div class="main-scroll">
       <div class="content">
 
+        <!-- ---------- 自动续期状态 ---------- -->
+        <section class="renew-card" id="renewCard" hidden>
+          <div class="renew-top">
+            <span class="renew-dot" id="renewDot"></span>
+            <span class="renew-title">证书自动续期</span>
+            <span class="renew-badge" id="renewBadge">读取中</span>
+            <span class="renew-spacer"></span>
+            <button class="btn btn-quiet btn-sm" id="btnRenewLog" type="button">查看日志</button>
+            <button class="btn btn-ghost btn-sm" id="btnRenewCheck" type="button">立即检查</button>
+          </div>
+          <div class="renew-meta" id="renewMeta">正在读取状态…</div>
+          <div class="renew-certs" id="renewCerts"></div>
+        </section>
+
         <!-- ---------- 步骤 1 ---------- -->
         <section class="panel" id="step1">
           <header class="panel-head">
@@ -423,6 +437,35 @@
     <p id="overlayText">正在处理…</p>
     <span id="overlayHint">请勿关闭此页面</span>
   </div>
+</div>
+
+<!-- 续期日志抽屉 -->
+<div class="logsheet hidden" id="logSheet">
+  <div class="logsheet-mask" id="logSheetMask"></div>
+  <aside class="logsheet-panel" role="dialog" aria-modal="true" aria-label="续期运行日志">
+    <header class="logsheet-head">
+      <div class="logsheet-title">
+        <h3>续期运行日志</h3>
+        <p id="logSheetSub">只读，来自 data\logs</p>
+      </div>
+      <button class="logsheet-close" id="logSheetClose" type="button" aria-label="关闭">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </header>
+    <div class="logsheet-tabs">
+      <button class="logsheet-tab is-on" data-kind="renew" type="button">检查记录</button>
+      <button class="logsheet-tab" data-kind="scheduler" type="button">调度事件</button>
+      <span class="logsheet-spacer"></span>
+      <select class="logsheet-date" id="logDate" title="选择日期"></select>
+      <button class="btn btn-ghost btn-sm" id="logRefresh" type="button">刷新</button>
+    </div>
+    <div class="logsheet-body" id="logSheetBody"></div>
+    <footer class="logsheet-foot">
+      <span id="logSheetFoot">签发与部署的完整输出在 renew-YYYYMMDD.log</span>
+    </footer>
+  </aside>
 </div>
 
 <div class="toast-wrap" id="toastWrap"></div>
